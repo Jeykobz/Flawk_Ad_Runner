@@ -1,108 +1,87 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# =========================
-# Flawk Ad Runner Installer
-# =========================
-# - Auto-detects login user
-# - Installs app in /opt/ad-runner
-# - Autostarts in the desktop session
-# - Validates inputs (venue name/type, lat, lon, cooldown, startup delay)
-# - Single-instance lock
-# - Initial 60s playback delay (configurable)
-# - Batch playback in a single mpv session
-# - Optional: mute other apps during playback (pactl)
-# - World-writable files to avoid permission issues
-
-# ---------- detect login user ----------
-detect_login_user() {
-  if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
-    echo "$SUDO_USER"; return
-  fi
-  if command -v logname >/dev/null 2>&1; then
-    local ln; ln=$(logname 2>/dev/null || true)
-    if [ -n "$ln" ] && [ "$ln" != "root" ]; then echo "$ln"; return; fi
-  fi
-  # fallback: first user from 'who', otherwise pi
-  local w; w=$(who | awk 'NR==1{print $1}')
-  if [ -n "$w" ]; then echo "$w"; else echo "pi"; fi
-}
-
-LOGIN_USER="$(detect_login_user)"
-USER_HOME="$(getent passwd "$LOGIN_USER" | cut -d: -f6 || echo "/home/$LOGIN_USER")"
-
-echo "[flawk] Detected login user: $LOGIN_USER (home: $USER_HOME)"
-
-# ---------- paths & defaults ----------
+# ===== Static paths =====
 APP_DIR="/opt/ad-runner"
 CACHE_DIR="$APP_DIR/cache"
 LOCK_FILE="$APP_DIR/ad_runner.lock"
 LOG_FILE="/var/log/ad_runner.log"
 CONF_JSON="$APP_DIR/config.json"
 
+# ===== Defaults you can tweak =====
 ORG_DEFAULT="golocal"
 WIDTH_DEFAULT=1920
 HEIGHT_DEFAULT=1080
-POLL_INTERVAL=3           # must be < 10s
-FILL_WINDOW=30
+POLL_INTERVAL=3         # < 10s as required
+FILL_WINDOW=30          # seconds to fill queue
 QUEUE_MAX=3
 PER_AD_COOLDOWN_DEFAULT=60
 INITIAL_DELAY_DEFAULT=60
+# ========================
 
-START_WRAPPER="$USER_HOME/bin/start-ad-runner.sh"
-AUTOSTART_DIR="$USER_HOME/.config/autostart"
-DESKTOP_FILE="$AUTOSTART_DIR/flawk-ad-runner.desktop"
+# ---------- helpers to detect the real desktop user ----------
+detect_run_user() {
+  if [ "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then echo "$SUDO_USER"; return; fi
+  if u=$(logname 2>/dev/null) && [ -n "$u" ] && [ "$u" != "root" ]; then echo "$u"; return; fi
+  if u=$(who | awk 'NR==1{print $1}'); then if [ -n "$u" ] && [ "$u" != "root" ]; then echo "$u"; return; fi; fi
+  if u=$(id -un 2>/dev/null) && [ "$u" != "root" ]; then echo "$u"; return; fi
+  read -rp "Enter the desktop username that should run Ad Runner: " u
+  [ -z "$u" ] && { echo "A username is required." >&2; exit 1; }
+  echo "$u"
+}
+RUN_USER="$(detect_run_user)"
+getent passwd "$RUN_USER" >/dev/null || { echo "User '$RUN_USER' not found on this system." >&2; exit 1; }
+user_home() { getent passwd "$RUN_USER" | cut -d: -f6; }
+as_user() { sudo -u "$RUN_USER" -H bash -lc "$*"; }
 
-# ---------- helpers ----------
-trim() { awk '{$1=$1; print}' <<<"$1"; }
+# ---------- validation helpers ----------
 is_float() { [[ "$1" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; }
 valid_lat() { is_float "$1" && awk -v v="$1" 'BEGIN{exit (v<-90 || v>90)}'; }
 valid_lon() { is_float "$1" && awk -v v="$1" 'BEGIN{exit (v<-180 || v>180)}'; }
 valid_int_pos() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -gt 0 ]; }
 valid_taxonomy() { [[ "$1" =~ ^[a-z]+([._-][a-z0-9]+)+$ ]]; }  # e.g., retail.malls
+trim() { awk '{$1=$1; print}' <<<"$1"; }
 
-# ---------- clean old install ----------
-echo "[flawk] Cleaning previous installation (if any)…"
-systemctl --user stop ad-runner.service 2>/dev/null || true
-systemctl --user disable ad-runner.service 2>/dev/null || true
+echo "== Using desktop user: $RUN_USER (home: $(user_home)) =="
+
+echo "== Clean out old install =="
 sudo systemctl stop ad-runner.service 2>/dev/null || true
 sudo systemctl disable ad-runner.service 2>/dev/null || true
 sudo rm -f /etc/systemd/system/ad-runner.service
 sudo systemctl daemon-reload || true
-
-rm -f "$DESKTOP_FILE" 2>/dev/null || true
+rm -f "$(user_home)/.config/systemd/user/ad-runner.service" 2>/dev/null || true
+rm -f "$(user_home)/.config/autostart/flawk-ad-runner.desktop" 2>/dev/null || true
 pkill -f ad_runner.py 2>/dev/null || true
 pkill -f mpv 2>/dev/null || true
-
-sudo rm -rf "$APP_DIR"
+sudo rm -rf "$APP_DIR" /etc/ad_runner.env
 sudo rm -f "$LOG_FILE" /var/log/mpv_player.log 2>/dev/null || true
 
-# ---------- install prerequisites ----------
-echo "[flawk] Installing dependencies…"
+echo "== Install prerequisites =="
 sudo apt-get update -y
 sudo apt-get install -y mpv python3 python3-venv python3-pip curl pulseaudio-utils
 
-# ---------- create structure ----------
-echo "[flawk] Creating app directories…"
+echo "== Create app structure =="
 sudo mkdir -p "$APP_DIR" "$CACHE_DIR"
 sudo touch "$LOG_FILE"
-sudo chown -R "$LOGIN_USER:$LOGIN_USER" "$APP_DIR" "$LOG_FILE"
+sudo chown -R "$RUN_USER:$RUN_USER" "$APP_DIR" "$LOG_FILE"
 sudo chmod -R 0777 "$APP_DIR"
 sudo chmod 0666 "$LOG_FILE"
 
-# ---------- gather config (prompts) ----------
-echo "[flawk] Collecting configuration…"
+echo "== Prompt for configuration =="
 
-read -rp "Device ID (free text, e.g., RPI-123): " DEVICE_ID
-[ -z "$DEVICE_ID" ] && { echo "Device ID is required."; exit 1; }
+# Device ID (free-form)
+read -rp "Device ID (e.g., PI-001): " DEVICE_ID
+[ -z "$DEVICE_ID" ] && { echo "Device ID is required"; exit 1; }
 
+# Venue name (validated, non-empty after trim)
 VENUE_NAME=""
 while :; do
   read -rp "Venue name (e.g., Mall of Example): " VENUE_NAME
   VENUE_NAME="$(trim "$VENUE_NAME")"
-  [ -n "$VENUE_NAME" ] && break || echo "Venue name cannot be empty."
+  if [ -n "$VENUE_NAME" ]; then break; else echo "Venue name cannot be empty."; fi
 done
 
+# Venue type from DOOH taxonomy list (validated)
 echo "Select DOOH venue type:"
 VENUE_CHOICES=(
   "retail.malls"
@@ -126,7 +105,7 @@ while :; do
     if [ "$VENUE_CHOICE" -eq ${#VENUE_CHOICES[@]} ]; then
       read -rp "Enter venue type (e.g., retail.malls): " VENUE_TYPE
       VENUE_TYPE="$(trim "$VENUE_TYPE")"
-      valid_taxonomy "$VENUE_TYPE" && break || echo "Invalid taxonomy. Use alpha[.alpha]+ (e.g., retail.malls)."
+      if valid_taxonomy "$VENUE_TYPE"; then break; else echo "Invalid taxonomy. Use segments like alpha[.alpha]+ (e.g., retail.malls)"; fi
     else
       VENUE_TYPE="${VENUE_CHOICES[$((VENUE_CHOICE-1))]}"
       break
@@ -136,16 +115,17 @@ while :; do
   fi
 done
 
-LAT=""; LON=""
+# Lat/Lon REQUIRED with validation loops
 while :; do
   read -rp "Latitude (-90..90): " LAT
-  valid_lat "$LAT" && break || echo "Invalid latitude (range -90..90)."
+  if valid_lat "$LAT"; then break; else echo "Invalid latitude. Must be numeric in range -90..90."; fi
 done
 while :; do
   read -rp "Longitude (-180..180): " LON
-  valid_lon "$LON" && break || echo "Invalid longitude (range -180..180)."
+  if valid_lon "$LON"; then break; else echo "Invalid longitude. Must be numeric in range -180..180."; fi
 done
 
+# Sound config (validated)
 PLAY_SOUND=true
 while :; do
   read -rp "Play ads with sound? [Y/n]: " SOUND_ANS
@@ -157,6 +137,7 @@ while :; do
   esac
 done
 
+# Duck/mute other applications during playback (validated)
 DUCK_OTHERS=true
 while :; do
   read -rp "Mute ALL other applications while ads play? [Y/n]: " DUCK_ANS
@@ -168,22 +149,21 @@ while :; do
   esac
 done
 
-COOLDOWN_PER_AD="$PER_AD_COOLDOWN_DEFAULT"
+# Per-ad cooldown (validated positive int)
 while :; do
-  read -rp "Cooldown per ad in seconds (default ${PER_AD_COOLDOWN_DEFAULT}): " x
-  x="${x:-$PER_AD_COOLDOWN_DEFAULT}"
-  if valid_int_pos "$x"; then COOLDOWN_PER_AD="$x"; break; else echo "Enter a positive integer."; fi
+  read -rp "Cooldown per ad in seconds (default ${PER_AD_COOLDOWN_DEFAULT}): " COOLDOWN_PER_AD
+  COOLDOWN_PER_AD="${COOLDOWN_PER_AD:-$PER_AD_COOLDOWN_DEFAULT}"
+  if valid_int_pos "$COOLDOWN_PER_AD"; then break; else echo "Enter a positive integer."; fi
 done
 
-INIT_DELAY="$INITIAL_DELAY_DEFAULT"
+# Initial startup delay (validated positive int)
 while :; do
-  read -rp "Initial startup delay BEFORE first playback (seconds, default ${INITIAL_DELAY_DEFAULT}): " x
-  x="${x:-$INITIAL_DELAY_DEFAULT}"
-  if valid_int_pos "$x"; then INIT_DELAY="$x"; break; else echo "Enter a positive integer."; fi
+  read -rp "Initial startup delay BEFORE first playback (seconds, default ${INITIAL_DELAY_DEFAULT}): " INIT_DELAY
+  INIT_DELAY="${INIT_DELAY:-$INITIAL_DELAY_DEFAULT}"
+  if valid_int_pos "$INIT_DELAY"; then break; else echo "Enter a positive integer."; fi
 done
 
-# ---------- write config ----------
-echo "[flawk] Writing config.json…"
+echo "== Write config.json =="
 cat > "$CONF_JSON" <<JSON
 {
   "device_id": "$DEVICE_ID",
@@ -208,13 +188,11 @@ cat > "$CONF_JSON" <<JSON
 JSON
 sudo chmod 0666 "$CONF_JSON"
 
-# ---------- python venv ----------
-echo "[flawk] Preparing Python environment…"
-python3 -m venv "$APP_DIR/.venv"
-"$APP_DIR/.venv/bin/pip" install --upgrade pip requests
+echo "== Create Python venv and install deps =="
+as_user "python3 -m venv '$APP_DIR/.venv'"
+as_user "'$APP_DIR/.venv/bin/pip' install --upgrade pip requests"
 
-# ---------- write application ----------
-echo "[flawk] Writing application…"
+echo "== Write ad_runner.py =="
 cat > "$APP_DIR/ad_runner.py" <<'PY'
 #!/usr/bin/env python3
 import os, sys, time, json, random, hashlib, threading, subprocess, logging, logging.handlers, fcntl
@@ -234,6 +212,7 @@ def acquire_singleton_lock(lock_path:str):
     except PermissionError:
         pass
     try:
+        import fcntl
         fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         print("Another ad-runner instance is already running. Exiting.", file=sys.stderr)
@@ -488,7 +467,6 @@ class Runner:
             self.fill_once()
 
     def _schedule_tracking_for_set(self, items, t0):
-        # schedule impressions + quartiles per ad along a single timeline
         offset = 0
         for ad in items:
             dur = max(1, ad["dur"])
@@ -512,7 +490,6 @@ class Runner:
         items=list(self.queue); self.queue.clear()
         self.log.info("Playing %d queued ads in one player session…", len(items))
         paths=[ad["path"] for ad in items]
-
         t0 = time.time() + 0.5
         self._schedule_tracking_for_set(items, t0)
 
@@ -570,38 +547,35 @@ PY
 chmod +x "$APP_DIR/ad_runner.py"
 sudo chmod -R 0777 "$APP_DIR"
 
-# ---------- start wrapper (no log redirection, avoid duplicate logs) ----------
-echo "[flawk] Creating start wrapper and autostart…"
-mkdir -p "$USER_HOME/bin" "$AUTOSTART_DIR"
-
-cat > "$START_WRAPPER" <<'SH'
+echo "== Create start script for user session (Autostart) =="
+as_user "mkdir -p ~/bin ~/.config/autostart"
+cat > "$(user_home)/bin/start-ad-runner.sh" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 export PYTHONUNBUFFERED=1
-# Light guard; real guard is file lock in the app
+# Optional extra guard (we already use a POSIX lock)
 if pgrep -f "/opt/ad-runner/ad_runner.py" >/dev/null 2>&1; then
-  echo "[flawk] ad-runner already running"
+  echo "ad-runner already running"
   exit 0
 fi
 exec /opt/ad-runner/.venv/bin/python /opt/ad-runner/ad_runner.py
 SH
-chmod +x "$START_WRAPPER"
-chown "$LOGIN_USER:$LOGIN_USER" "$START_WRAPPER"
+chmod +x "$(user_home)/bin/start-ad-runner.sh"
 
-cat > "$DESKTOP_FILE" <<EOF
+echo "== Create desktop Autostart entry =="
+cat > "$(user_home)/.config/autostart/flawk-ad-runner.desktop" <<DESK
 [Desktop Entry]
 Type=Application
 Name=Flawk Ad Runner
 Comment=Polls VAST and plays full-screen ads
-Exec=$START_WRAPPER
+Exec=$(user_home)/bin/start-ad-runner.sh
 X-GNOME-Autostart-enabled=true
-EOF
-chown "$LOGIN_USER:$LOGIN_USER" "$DESKTOP_FILE"
+DESK
+chown "$RUN_USER:$RUN_USER" "$(user_home)/.config/autostart/flawk-ad-runner.desktop"
 
-# ---------- start now (in current session) ----------
-echo "[flawk] Starting now (if a desktop session is active)…"
-sudo -u "$LOGIN_USER" -H bash -lc "$START_WRAPPER &" || true
+echo "== Start now in this session =="
+as_user "$(user_home)/bin/start-ad-runner.sh &"
 
-echo "[flawk] Done."
-echo "Logs: tail -f /var/log/ad_runner.log /var/log/mpv_player.log"
-echo "On boot: ensure the device uses Desktop Autologin (raspi-config → System Options → Boot / Auto Login → Desktop Autologin)."
+echo "== Done. Tail the logs below =="
+echo "tail -f /var/log/ad_runner.log /var/log/mpv_player.log"
+echo "Enable Desktop Autologin (for start on boot): sudo raspi-config → System Options → Boot / Auto Login → Desktop Autologin"
