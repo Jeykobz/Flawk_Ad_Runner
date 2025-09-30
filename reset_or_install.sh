@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ==============================================================================
-# Flawk Ad Runner - Reset & Install (Full)
+# Flawk Ad Runner - Reset & Install (Bullet-Proof Impressions, IPv4-only)
 # ==============================================================================
 
 # ---------- Installer logging ----------
@@ -24,7 +24,7 @@ CONF_JSON="$APP_DIR/config.json"
 LOG_FILE="/var/log/ad_runner.log"
 MPV_LOG_FILE="/var/log/mpv_player.log"
 
-# Defaults & timings
+# Defaults
 ORG_DEFAULT="golocal"      # per requirement
 WIDTH_DEFAULT=1920
 HEIGHT_DEFAULT=1080
@@ -93,7 +93,7 @@ sudo rm -f "$LOG_FILE" "$MPV_LOG_FILE" 2>/dev/null || true
 # ---------- Dependencies ----------
 echo "== Install prerequisites =="
 sudo apt-get update -y
-sudo apt-get install -y mpv python3 python3-venv python3-pip curl pulseaudio-utils ca-certificates jq
+sudo apt-get install -y mpv python3 python3-venv python3-pip curl ca-certificates jq pulseaudio-utils
 
 # ---------- App structure ----------
 echo "== Create app structure =="
@@ -185,7 +185,7 @@ done
 
 FORCE_IPV4=true
 while :; do
-  read -rp "Force IPv4 for all HTTP calls? (safer on some networks) [Y/n]: " IPV4_ANS
+  read -rp "Force IPv4 for all HTTP calls? (recommended) [Y/n]: " IPV4_ANS
   IPV4_ANS="${IPV4_ANS:-Y}"
   case "$IPV4_ANS" in y|Y) FORCE_IPV4=true; break ;; n|N) FORCE_IPV4=false; break ;; *) echo "Please answer Y or N." ;; esac
 done
@@ -220,7 +220,7 @@ sudo chmod 0666 "$CONF_JSON"
 # ---------- Python venv ----------
 echo "== Create Python venv =="
 sudo -u "$RUN_USER" -H python3 -m venv "$APP_DIR/.venv"
-sudo -u "$RUN_USER" -H "$APP_DIR/.venv/bin/pip" install --upgrade pip requests
+sudo -u "$RUN_USER" -H "$APP_DIR/.venv/bin/pip" install --upgrade pip requests urllib3
 
 # ---------- Application (ad_runner.py) ----------
 echo "== Write ad_runner.py =="
@@ -230,16 +230,19 @@ import os, sys, time, json, random, hashlib, threading, subprocess, logging, log
 import urllib.parse as up
 from pathlib import Path
 from xml.etree import ElementTree as ET
+
 import requests
 from requests.adapters import HTTPAdapter
-from urllib3.util import connection
+from urllib3.util import connection, Retry
 
 LOCK_PATH = "/opt/ad-runner/ad_runner.lock"
-HEADERS = {"User-Agent":"FlawkAdRunner/1.2 (Raspberry Pi; Linux; mpv)","Accept":"application/xml,text/xml,*/*"}
+HEADERS = {"User-Agent":"FlawkAdRunner/1.3 (Raspberry Pi; Linux; mpv)","Accept":"application/xml,text/xml,*/*"}
 TIMEOUT = 10
 
-# ----- IPv4-only adapter (optional) -----
+# ----- IPv4-only adapter with retries -----
 class IPv4HTTPAdapter(HTTPAdapter):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
     def init_poolmanager(self, *args, **kwargs):
         fam = socket.AF_INET
         orig = connection.allowed_gai_family
@@ -250,10 +253,19 @@ class IPv4HTTPAdapter(HTTPAdapter):
 
 def make_session(force_ipv4: bool):
     s = requests.Session()
-    s.headers.update(HEADERS)
+    retries = Retry(
+        total=2, connect=2, read=2,
+        backoff_factor=0.4,
+        status_forcelist=[429,500,502,503,504],
+        allowed_methods=["GET", "HEAD"]
+    )
     if force_ipv4:
-        s.mount("http://", IPv4HTTPAdapter())
-        s.mount("https://", IPv4HTTPAdapter())
+        adapter = IPv4HTTPAdapter(max_retries=retries)
+        s.mount("http://", adapter); s.mount("https://", adapter)
+    else:
+        adapter = HTTPAdapter(max_retries=retries)
+        s.mount("http://", adapter); s.mount("https://", adapter)
+    s.headers.update(HEADERS)
     return s
 
 def acquire_singleton_lock(lock_path:str):
@@ -284,16 +296,6 @@ def ext_ip():
         try:
             r = requests.get(url, timeout=3, headers={"User-Agent": HEADERS["User-Agent"]})
             if r.ok and r.text.strip(): return r.text.strip()
-        except Exception: pass
-    return None
-
-def ext_ipv6():
-    for url in ("https://api64.ipify.org","https://ifconfig.co/ip"):
-        try:
-            r = requests.get(url, timeout=3, headers={"User-Agent": HEADERS["User-Agent"]})
-            if r.ok:
-                ip = r.text.strip()
-                if ":" in ip: return ip
         except Exception: pass
     return None
 
@@ -357,39 +359,69 @@ def _media_files_from_xml_bytes(xml_bytes):
 def follow_wrappers(xml_bytes, session, depth=0, max_depth=4):
     if depth>max_depth: return None
     root=None
-    try: root = ET.fromstring(xml_bytes)
-    except Exception: pass
+    try:
+        root = ET.fromstring(xml_bytes)
+    except Exception:
+        root = None
 
+    # Wrapper
     if root is not None:
         tag = root.find(".//{*}VASTAdTagURI")
         if tag is not None and (tag.text or "").strip():
             next_url = (tag.text or "").strip()
-            try: child = session.get(next_url, timeout=TIMEOUT)
-            except Exception: return None
-            if not child.ok: return None
+            try:
+                child = session.get(next_url, timeout=TIMEOUT)
+            except Exception:
+                return None
+            if not child.ok:
+                return None
             inner = follow_wrappers(child.content, session, depth+1, max_depth)
-            wrap_imps = [ _strip_cdata((n.text or "")) for n in root.findall(".//{*}Impression") if (n.text or "").strip() ]
-            if inner: inner["impressions"] = wrap_imps + inner.get("impressions",[])
+            # wrapper-level impressions (XML + regex fallback)
+            wrap_imps = []
+            for n in root.findall(".//{*}Impression"):
+                t = (n.text or "").strip()
+                if t: wrap_imps.append(_strip_cdata(t))
+            if not wrap_imps:
+                txt = xml_bytes.decode("utf-8", errors="ignore")
+                for m in re.finditer(r"<\s*Impression\b[^>]*>(.*?)</\s*Impression\s*>", txt, re.I|re.S):
+                    inner_txt = re.sub(r"^\s*<!\[CDATA\[(.*?)\]\]>\s*$", r"\1", m.group(1).strip(), flags=re.S)
+                    if inner_txt.strip(): wrap_imps.append(inner_txt.strip())
+            if inner:
+                inner["impressions"] = wrap_imps + inner.get("impressions", [])
             return inner
 
-    impressions=[]; trackers={"start":[], "firstQuartile":[], "midpoint":[], "thirdQuartile":[], "complete":[]}; duration=0
+    # Inline
+    impressions = []
+    trackers = {"start":[], "firstQuartile":[], "midpoint":[], "thirdQuartile":[], "complete":[]}
+    duration = 0
     if root is not None:
-        impressions = [ _strip_cdata((n.text or "")) for n in root.findall(".//{*}Impression") if (n.text or "").strip() ]
+        for n in root.findall(".//{*}Impression"):
+            t = (n.text or "").strip()
+            if t: impressions.append(_strip_cdata(t))
+        if not impressions:
+            txt = xml_bytes.decode("utf-8", errors="ignore")
+            for m in re.finditer(r"<\s*Impression\b[^>]*>(.*?)</\s*Impression\s*>", txt, re.I|re.S):
+                inner = re.sub(r"^\s*<!\[CDATA\[(.*?)\]\]>\s*$", r"\1", m.group(1).strip(), flags=re.S)
+                if inner.strip(): impressions.append(inner.strip())
         for tr in root.findall(".//{*}Tracking"):
-            ev=tr.get("event") or ""; url=(tr.text or "").strip()
-            if ev in trackers and url: trackers[ev].append(url)
+            ev = tr.get("event") or ""
+            url = (tr.text or "").strip()
+            if ev in trackers and url:
+                trackers[ev].append(url)
         dn = root.find(".//{*}Duration")
-        if dn is not None and dn.text: duration = parse_duration(dn.text)
+        if dn is not None and dn.text:
+            duration = parse_duration(dn.text)
     else:
         txt = xml_bytes.decode("utf-8", errors="ignore")
-        for m in re.findall(r"<Impression[^>]*>(.*?)</Impression>", txt, re.I|re.S):
-            u = re.sub(r"^\s*<!\[CDATA\[(.*?)\]\]>\s*$", r"\1", m.strip(), flags=re.S)
-            if u.strip(): impressions.append(u.strip())
+        for m in re.finditer(r"<\s*Impression\b[^>]*>(.*?)</\s*Impression\s*>", txt, re.I|re.S):
+            inner = re.sub(r"^\s*<!\[CDATA\[(.*?)\]\]>\s*$", r"\1", m.group(1).strip(), flags=re.S)
+            if inner.strip(): impressions.append(inner.strip())
         md = re.search(r"<Duration[^>]*>(.*?)</Duration>", txt, re.I|re.S)
-        if md: duration = parse_duration(md.group(1).strip())
+        if md:
+            duration = parse_duration(md.group(1).strip())
 
     media_files = _media_files_from_xml_bytes(xml_bytes)
-    return {"impressions":impressions, "trackers":trackers, "duration":duration, "media_files":media_files}
+    return {"impressions": impressions, "trackers": trackers, "duration": duration, "media_files": media_files}
 
 def choose_media(media_files, want_w, want_h):
     def is_playable(mf):
@@ -474,6 +506,26 @@ class MPV:
             last_rc=proc.returncode; last_err=(proc.stderr or "").strip()[:200]
         logging.getLogger("ad-runner").error("mpv failed: %s %s", last_rc, last_err); return False
 
+# --------- SUPER BULLET-PROOF IMPRESSION CALLER ----------
+def http_status_ok(code:int)->bool:
+    return code is not None and 200 <= code < 400
+
+def curl_fallback_ipv4(url:str, timeout_sec:int=5):
+    # Use curl -4 as a last resort; returns (ok, http_code, errstr)
+    try:
+        proc = subprocess.run(
+            ["curl","-4","-m",str(timeout_sec),"-sS","-o","/dev/null","-w","%{http_code}", url],
+            capture_output=True, text=True
+        )
+        code = None
+        if proc.returncode==0:
+            try:
+                code = int(proc.stdout.strip() or "0")
+            except: code = None
+        return (http_status_ok(code), code, (proc.stderr or "").strip())
+    except Exception as e:
+        return (False, None, f"curl_exc:{e}")
+
 class Runner:
     def __init__(self, cfg_path:str):
         cfg = json.load(open(cfg_path,"r"))
@@ -496,7 +548,7 @@ class Runner:
         self.api    = cfg.get("api_url_base") or "https://cms.flawkai.com/api/ads"
         self.play_sound = bool(cfg.get("play_sound", True))
         self.duck_other_audio = bool(cfg.get("duck_other_audio", True))
-        self.force_ipv4 = bool(cfg.get("force_ipv4", False))
+        self.force_ipv4 = bool(cfg.get("force_ipv4", True))
         self.http = make_session(self.force_ipv4)
         self.log    = Log(cfg.get("log_file") or "/var/log/ad_runner.log")
         ensure_dir(self.cache)
@@ -516,28 +568,41 @@ class Runner:
             "venue_name": self.venue_name,
             "lat": self.lat, "lon": self.lon,
         }
-        # best-effort IPs
         ip4 = ext_ip()
-        ip6 = ext_ipv6()
         if ip4: params["ip"] = ip4
-        if ip6: params["ipv6"] = ip6
         return self.api + "?" + up.urlencode(params)
+
+    # ---- super bullet-proof firing (retries + curl -4 fallback) ----
+    def _fire_one(self, url: str, label: str, duration:int, playhead:int):
+        u = replace_macros(url, duration, playhead)
+        # try Requests (with retries adapter)
+        try:
+            r = self.http.get(u, timeout=5)
+            code = r.status_code
+            if http_status_ok(code):
+                self.log.info("Track %s -> %s  %s", label, code, u[:160]); return
+            else:
+                self.log.warn("Track %s non-OK -> %s  %s", label, code, u[:160])
+        except Exception as e:
+            self.log.warn("Track %s exception -> %s  %s", label, e, u[:160])
+        # curl -4 fallback
+        ok, code, err = curl_fallback_ipv4(u, timeout_sec=5)
+        if ok:
+            self.log.info("Track %s via curl -4 -> %s  %s", label, code, u[:160])
+        else:
+            self.log.err("Track %s FAILED (curl fallback) code=%s err=%s  %s", label, code, err, u[:160])
 
     def fire(self, urls, duration=0, playhead=0, label=""):
         if not urls: return
         def worker(v):
             for raw in v:
-                u = replace_macros(raw, duration, playhead)
-                try:
-                    r = self.http.get(u, timeout=3)
-                    self.log.info("Track %s -> %s  %s", label or "ping", r.status_code, u[:160])
-                except Exception as e:
-                    self.log.warn("Track %s FAILED :: %s  %s", label or "ping", e, u[:160])
+                self._fire_one(raw, label or "ping", duration, playhead)
         threading.Thread(target=worker, args=(list(urls),), daemon=True).start()
         if label: self.log.info("Fired %s x %d", label, len(urls))
 
     def fill_once(self):
         url = self.req_url()
+        self.log.info("Requesting VAST: %s", url)
         r = self.http.get(url, timeout=TIMEOUT)
         if r.status_code==204 or not r.content:
             time.sleep(self.poll); return False
@@ -577,6 +642,16 @@ class Runner:
             "imps": parsed.get("impressions", []),
             "trk": parsed.get("trackers", {})
         }
+        self.log.info("Ad has %d impression(s) and trackers: start=%d Q1=%d mid=%d Q3=%d complete=%d",
+                      len(ad["imps"]),
+                      len(ad["trk"].get("start",[])),
+                      len(ad["trk"].get("firstQuartile",[])),
+                      len(ad["trk"].get("midpoint",[])),
+                      len(ad["trk"].get("thirdQuartile",[])),
+                      len(ad["trk"].get("complete",[])))
+        if ad["imps"]:
+            self.log.info("First impression URL: %s", ad["imps"][0])
+
         self.queue.append(ad)
         self.log.info("Queued ad %d/%d from %s", len(self.queue), self.qmax, media_url)
         time.sleep(self.poll); return True
