@@ -1,74 +1,78 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ===== Install log (capture all output and errors) =====
+# ==============================================================================
+# Flawk Ad Runner - Reset & Install (Full)
+# ==============================================================================
+
+# ---------- Installer logging ----------
 INSTALL_LOG="/var/log/ad_runner_install.log"
 sudo touch "$INSTALL_LOG" >/dev/null 2>&1 || true
 sudo chmod 0666 "$INSTALL_LOG" >/dev/null 2>&1 || true
-# Redirect all stdout+stderr to the install log (and to the terminal)
 exec > >(tee -a "$INSTALL_LOG") 2>&1
 
-# Ensure prompts work even when piped (curl | bash)
+# Make interactive prompts work when piped (curl | bash)
 if [ ! -t 0 ] && [ -r /dev/tty ]; then
   exec </dev/tty
 fi
 
-# ===== Static paths =====
+# ---------- Constants ----------
 APP_DIR="/opt/ad-runner"
 CACHE_DIR="$APP_DIR/cache"
 LOCK_FILE="$APP_DIR/ad_runner.lock"
+CONF_JSON="$APP_DIR/config.json"
 LOG_FILE="/var/log/ad_runner.log"
 MPV_LOG_FILE="/var/log/mpv_player.log"
-CONF_JSON="$APP_DIR/config.json"
 
-# ===== Defaults =====
-ORG_DEFAULT="golocal"
+# Defaults & timings
+ORG_DEFAULT="golocal"      # per requirement
 WIDTH_DEFAULT=1920
 HEIGHT_DEFAULT=1080
-POLL_INTERVAL=3           # <10s as requested
+POLL_INTERVAL=3            # < 10s (requirement 12)
 FILL_WINDOW=30
 QUEUE_MAX=3
-PER_AD_COOLDOWN_DEFAULT=60
-INITIAL_DELAY_DEFAULT=60
+PER_AD_COOLDOWN_DEFAULT=60 # requirement: 60s per ad (configurable)
+INITIAL_DELAY_DEFAULT=60   # requirement: delay before first session
 
-# ---------- Detect the real desktop/user ----------
+# ---------- Helpers ----------
+die(){ echo "ERROR: $*" >&2; exit 1; }
+trim(){ awk '{$1=$1; print}' <<<"$1"; }
+
 detect_run_user() {
   if [ "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then echo "$SUDO_USER"; return; fi
   if u=$(logname 2>/dev/null) && [ -n "$u" ] && [ "$u" != "root" ]; then echo "$u"; return; fi
-  if u=$(who | awk 'NR==1{print $1}'); then if [ -n "$u" ] && [ "$u" != "root" ]; then echo "$u"; return; fi; fi
+  if u=$(who | awk 'NR==1{print $1}'); then [ -n "$u" ] && [ "$u" != "root" ] && echo "$u" && return; fi
   if u=$(id -un 2>/dev/null) && [ "$u" != "root" ]; then echo "$u"; return; fi
-  read -rp "Enter the desktop username that should run Ad Runner: " u
-  [ -z "$u" ] && { echo "A username is required." >&2; exit 1; }
+  read -rp "Enter desktop username to run the Ad Runner: " u
+  [ -z "$u" ] && die "Username is required."
   echo "$u"
 }
-RUN_USER="$(detect_run_user)"
-getent passwd "$RUN_USER" >/dev/null || { echo "User '$RUN_USER' not found." >&2; exit 1; }
-USER_HOME="$(getent passwd "$RUN_USER" | cut -d: -f6)"
-echo "== Using desktop user: $RUN_USER (home: $USER_HOME) =="
 
-as_user() { sudo -u "$RUN_USER" -H bash -lc "$*"; }
+valid_int_pos(){ [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -gt 0 ]; }
+is_float(){ [[ "$1" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; }
+valid_lat(){ is_float "$1" && awk -v v="$1" 'BEGIN{exit (v<-90 || v>90)}'; }
+valid_lon(){ is_float "$1" && awk -v v="$1" 'BEGIN{exit (v<-180 || v>180)}'; }
+valid_taxonomy(){ [[ "$1" =~ ^[a-z]+([._-][a-z0-9]+)+$ ]]; } # e.g. retail.malls
 
-# ---------- Validation helpers ----------
-is_float() { [[ "$1" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; }
-valid_lat() { is_float "$1" && awk -v v="$1" 'BEGIN{exit (v<-90 || v>90)}'; }
-valid_lon() { is_float "$1" && awk -v v="$1" 'BEGIN{exit (v<-180 || v>180)}'; }
-valid_int_pos() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -gt 0 ]; }
-valid_taxonomy() { [[ "$1" =~ ^[a-z]+([._-][a-z0-9]+)+$ ]]; }  # e.g., retail.malls
-trim() { awk '{$1=$1; print}' <<<"$1"; }
+as_user(){ sudo -u "$RUN_USER" -H bash -lc "$*"; }
 
-# ---------- Make user bus available (prevents 'No Medium found') ----------
 ensure_user_bus() {
-  local user="$1"
-  local uid; uid=$(id -u "$user")
-  sudo loginctl enable-linger "$user" >/dev/null 2>&1 || true
+  local u="$1"; local uid; uid=$(id -u "$u")
+  sudo loginctl enable-linger "$u" >/dev/null 2>&1 || true
   if ! systemctl is-active "user@${uid}.service" >/dev/null 2>&1; then
-    sudo systemctl start "user@${uid}.service"
+    sudo systemctl start "user@${uid}.service" || true
     sleep 1
   fi
   export XDG_RUNTIME_DIR="/run/user/${uid}"
 }
 
-# ---------- Clean out old install ----------
+# ---------- Start ----------
+RUN_USER="$(detect_run_user)"
+getent passwd "$RUN_USER" >/dev/null || die "User '$RUN_USER' not found."
+USER_HOME="$(getent passwd "$RUN_USER" | cut -d: -f6)"
+echo "== Using desktop user: $RUN_USER (home: $USER_HOME) =="
+
+# ---------- Clean old install ----------
 echo "== Clean out old install =="
 as_user 'systemctl --user stop ad-runner.service 2>/dev/null || true'
 as_user 'systemctl --user disable ad-runner.service 2>/dev/null || true'
@@ -89,7 +93,7 @@ sudo rm -f "$LOG_FILE" "$MPV_LOG_FILE" 2>/dev/null || true
 # ---------- Dependencies ----------
 echo "== Install prerequisites =="
 sudo apt-get update -y
-sudo apt-get install -y mpv python3 python3-venv python3-pip curl pulseaudio-utils
+sudo apt-get install -y mpv python3 python3-venv python3-pip curl pulseaudio-utils ca-certificates jq
 
 # ---------- App structure ----------
 echo "== Create app structure =="
@@ -101,9 +105,8 @@ sudo chmod 0666 "$LOG_FILE" "$MPV_LOG_FILE"
 
 # ---------- Prompts ----------
 echo "== Prompt for configuration =="
-
-read -rp "Device ID (free-form, required): " DEVICE_ID
-[ -z "$DEVICE_ID" ] && { echo "Device ID is required"; exit 1; }
+read -rp "Device ID (required): " DEVICE_ID
+[ -z "$DEVICE_ID" ] && die "Device ID is required."
 
 VENUE_NAME=""
 while :; do
@@ -127,6 +130,7 @@ VENUE_CHOICES=(
   "other (enter manually)"
 )
 i=1; for v in "${VENUE_CHOICES[@]}"; do printf "  %2d) %s\n" "$i" "$v"; i=$((i+1)); done
+
 VENUE_TYPE=""
 while :; do
   read -rp "Choice [1-${#VENUE_CHOICES[@]}, default 4]: " VENUE_CHOICE
@@ -135,7 +139,7 @@ while :; do
     if [ "$VENUE_CHOICE" -eq ${#VENUE_CHOICES[@]} ]; then
       read -rp "Enter venue type (e.g., retail.malls): " VENUE_TYPE
       VENUE_TYPE="$(trim "$VENUE_TYPE")"
-      valid_taxonomy "$VENUE_TYPE" && break || echo "Invalid taxonomy. Use alpha segments with dots, e.g., retail.malls"
+      valid_taxonomy "$VENUE_TYPE" && break || echo "Invalid taxonomy. Use segments with dots, e.g., retail.malls"
     else
       VENUE_TYPE="${VENUE_CHOICES[$((VENUE_CHOICE-1))]}"; break
     fi
@@ -146,11 +150,11 @@ done
 
 while :; do
   read -rp "Latitude (-90..90): " LAT
-  valid_lat "$LAT" && break || echo "Invalid latitude. Must be numeric in range -90..90."
+  valid_lat "$LAT" && break || echo "Invalid latitude. Must be numeric in -90..90."
 done
 while :; do
   read -rp "Longitude (-180..180): " LON
-  valid_lon "$LON" && break || echo "Invalid longitude. Must be numeric in range -180..180."
+  valid_lon "$LON" && break || echo "Invalid longitude. Must be numeric in -180..180."
 done
 
 PLAY_SOUND=true
@@ -168,7 +172,7 @@ while :; do
 done
 
 while :; do
-  read -rp "Cooldown per ad in seconds (default ${PER_AD_COOLDOWN_DEFAULT}): " COOLDOWN_PER_AD
+  read -rp "Cooldown per ad seconds (default ${PER_AD_COOLDOWN_DEFAULT}): " COOLDOWN_PER_AD
   COOLDOWN_PER_AD="${COOLDOWN_PER_AD:-$PER_AD_COOLDOWN_DEFAULT}"
   valid_int_pos "$COOLDOWN_PER_AD" && break || echo "Enter a positive integer."
 done
@@ -177,6 +181,13 @@ while :; do
   read -rp "Initial startup delay BEFORE first playback (seconds, default ${INITIAL_DELAY_DEFAULT}): " INIT_DELAY
   INIT_DELAY="${INIT_DELAY:-$INITIAL_DELAY_DEFAULT}"
   valid_int_pos "$INIT_DELAY" && break || echo "Enter a positive integer."
+done
+
+FORCE_IPV4=true
+while :; do
+  read -rp "Force IPv4 for all HTTP calls? (safer on some networks) [Y/n]: " IPV4_ANS
+  IPV4_ANS="${IPV4_ANS:-Y}"
+  case "$IPV4_ANS" in y|Y) FORCE_IPV4=true; break ;; n|N) FORCE_IPV4=false; break ;; *) echo "Please answer Y or N." ;; esac
 done
 
 # ---------- Write config ----------
@@ -200,33 +211,50 @@ cat > "$CONF_JSON" <<JSON
   "cache_dir": "$CACHE_DIR",
   "log_file": "$LOG_FILE",
   "play_sound": $PLAY_SOUND,
-  "duck_other_audio": $DUCK_OTHERS
+  "duck_other_audio": $DUCK_OTHERS,
+  "force_ipv4": $FORCE_IPV4
 }
 JSON
 sudo chmod 0666 "$CONF_JSON"
 
 # ---------- Python venv ----------
-echo "== Create Python venv and install deps =="
+echo "== Create Python venv =="
 sudo -u "$RUN_USER" -H python3 -m venv "$APP_DIR/.venv"
 sudo -u "$RUN_USER" -H "$APP_DIR/.venv/bin/pip" install --upgrade pip requests
 
-# ---------- Runner code (with IPv6 support) ----------
+# ---------- Application (ad_runner.py) ----------
 echo "== Write ad_runner.py =="
 sudo tee "$APP_DIR/ad_runner.py" >/dev/null <<'PY'
 #!/usr/bin/env python3
-import os, sys, time, json, random, hashlib, threading, subprocess, logging, logging.handlers, fcntl, re
+import os, sys, time, json, random, hashlib, threading, subprocess, logging, logging.handlers, fcntl, re, socket
 import urllib.parse as up
 from pathlib import Path
 from xml.etree import ElementTree as ET
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import connection
 
 LOCK_PATH = "/opt/ad-runner/ad_runner.lock"
-
-HEADERS = {
-    "User-Agent": "FlawkAdRunner/1.0 (Raspberry Pi; Linux; mpv)",
-    "Accept": "application/xml,text/xml;q=0.9,*/*;q=0.8",
-}
+HEADERS = {"User-Agent":"FlawkAdRunner/1.2 (Raspberry Pi; Linux; mpv)","Accept":"application/xml,text/xml,*/*"}
 TIMEOUT = 10
+
+# ----- IPv4-only adapter (optional) -----
+class IPv4HTTPAdapter(HTTPAdapter):
+    def init_poolmanager(self, *args, **kwargs):
+        fam = socket.AF_INET
+        orig = connection.allowed_gai_family
+        def v4(): return fam
+        connection.allowed_gai_family = v4
+        try: super().init_poolmanager(*args, **kwargs)
+        finally: connection.allowed_gai_family = orig
+
+def make_session(force_ipv4: bool):
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    if force_ipv4:
+        s.mount("http://", IPv4HTTPAdapter())
+        s.mount("https://", IPv4HTTPAdapter())
+    return s
 
 def acquire_singleton_lock(lock_path:str):
     Path(os.path.dirname(lock_path)).mkdir(parents=True, exist_ok=True)
@@ -238,19 +266,12 @@ def acquire_singleton_lock(lock_path:str):
         print("Another ad-runner instance is already running. Exiting.", file=sys.stderr); sys.exit(0)
     return fp
 
-def load_json(path, default=None):
-    try:
-        with open(path, "r", encoding="utf-8") as f: return json.load(f)
-    except Exception: return default
-
 def ensure_dir(p:str): Path(p).mkdir(parents=True, exist_ok=True)
-
 def sha256_hex(s:str)->str: return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 def parse_duration(t:str)->int:
-    if t is None: return 0
+    if not t: return 0
     s=str(t).strip()
-    if not s: return 0
     if ":" not in s:
         try: return int(float(s))
         except: return 0
@@ -299,6 +320,12 @@ class Log:
     def warn(self,*a): self.l.warning(" ".join(map(str,a)))
     def err (self,*a): self.l.error(" ".join(map(str,a)))
 
+def _strip_cdata(s:str)->str:
+    if not s: return ""
+    s = s.strip()
+    m = re.match(r"^<!\[CDATA\[(.*)\]\]>$", s, flags=re.S)
+    return m.group(1).strip() if m else s
+
 def _media_files_from_xml_bytes(xml_bytes):
     media=[]
     try:
@@ -310,58 +337,55 @@ def _media_files_from_xml_bytes(xml_bytes):
             h = (mf.get("height") or "").strip()
             media.append({"url":url,"type":typ,"width":w,"height":h})
     except Exception:
-        pass
+        root=None
     if media: return media
+    # regex fallback
     try:
         txt = xml_bytes.decode("utf-8", errors="ignore")
-        pat = re.compile(r"<\s*MediaFile\b([^>]*)>(.*?)</\s*MediaFile\s*>", re.IGNORECASE|re.DOTALL)
+        pat = re.compile(r"<\s*MediaFile\b([^>]*)>(.*?)</\s*MediaFile\s*>", re.I|re.S)
         for m in pat.finditer(txt):
             attrs, inner = m.group(1), m.group(2)
-            def get_attr(name):
-                r = re.search(rf'{name}\s*=\s*"([^"]*)"', attrs, re.IGNORECASE)
+            def ga(name):
+                r = re.search(rf'{name}\s*=\s*"([^"]*)"', attrs, re.I)
                 return r.group(1) if r else ""
-            url = re.sub(r"^\s*<!\[CDATA\[(.*?)\]\]>\s*$", r"\1", inner.strip(), flags=re.DOTALL)
-            media.append({
-                "url": url.strip(),
-                "type": get_attr("type").strip(),
-                "width": get_attr("width").strip(),
-                "height": get_attr("height").strip(),
-            })
+            url = re.sub(r"^\s*<!\[CDATA\[(.*?)\]\]>\s*$", r"\1", inner.strip(), flags=re.S)
+            media.append({"url": url.strip(), "type": ga("type"), "width": ga("width"), "height": ga("height")})
     except Exception:
         pass
     return media
 
-def follow_wrappers(xml_bytes, depth=0, max_depth=4):
+def follow_wrappers(xml_bytes, session, depth=0, max_depth=4):
     if depth>max_depth: return None
     root=None
     try: root = ET.fromstring(xml_bytes)
     except Exception: pass
 
     if root is not None:
-        tag_uri = root.find(".//{*}VASTAdTagURI")
-        if tag_uri is not None and (tag_uri.text or "").strip():
-            next_url = (tag_uri.text or "").strip()
-            try: child = requests.get(next_url, timeout=TIMEOUT, headers=HEADERS)
+        tag = root.find(".//{*}VASTAdTagURI")
+        if tag is not None and (tag.text or "").strip():
+            next_url = (tag.text or "").strip()
+            try: child = session.get(next_url, timeout=TIMEOUT)
             except Exception: return None
             if not child.ok: return None
-            inner = follow_wrappers(child.content, depth+1, max_depth)
-            wrap_imps = [ (n.text or "").strip() for n in root.findall(".//{*}Impression") if (n.text or "").strip() ]
+            inner = follow_wrappers(child.content, session, depth+1, max_depth)
+            wrap_imps = [ _strip_cdata((n.text or "")) for n in root.findall(".//{*}Impression") if (n.text or "").strip() ]
             if inner: inner["impressions"] = wrap_imps + inner.get("impressions",[])
             return inner
 
     impressions=[]; trackers={"start":[], "firstQuartile":[], "midpoint":[], "thirdQuartile":[], "complete":[]}; duration=0
     if root is not None:
-        impressions = [ (n.text or "").strip() for n in root.findall(".//{*}Impression") if (n.text or "").strip() ]
+        impressions = [ _strip_cdata((n.text or "")) for n in root.findall(".//{*}Impression") if (n.text or "").strip() ]
         for tr in root.findall(".//{*}Tracking"):
             ev=tr.get("event") or ""; url=(tr.text or "").strip()
             if ev in trackers and url: trackers[ev].append(url)
-        dur_node = root.find(".//{*}Duration")
-        if dur_node is not None and dur_node.text: duration = parse_duration(dur_node.text)
+        dn = root.find(".//{*}Duration")
+        if dn is not None and dn.text: duration = parse_duration(dn.text)
     else:
         txt = xml_bytes.decode("utf-8", errors="ignore")
-        for m in re.findall(r"<Impression[^>]*>(.*?)</Impression>", txt, re.IGNORECASE|re.DOTALL):
-            impressions.append(re.sub(r"^\s*<!\[CDATA\[(.*?)\]\]>\s*$", r"\1", m.strip(), flags=re.DOTALL))
-        md = re.search(r"<Duration[^>]*>(.*?)</Duration>", txt, re.IGNORECASE|re.DOTALL)
+        for m in re.findall(r"<Impression[^>]*>(.*?)</Impression>", txt, re.I|re.S):
+            u = re.sub(r"^\s*<!\[CDATA\[(.*?)\]\]>\s*$", r"\1", m.strip(), flags=re.S)
+            if u.strip(): impressions.append(u.strip())
+        md = re.search(r"<Duration[^>]*>(.*?)</Duration>", txt, re.I|re.S)
         if md: duration = parse_duration(md.group(1).strip())
 
     media_files = _media_files_from_xml_bytes(xml_bytes)
@@ -452,7 +476,7 @@ class MPV:
 
 class Runner:
     def __init__(self, cfg_path:str):
-        cfg = load_json(cfg_path, {})
+        cfg = json.load(open(cfg_path,"r"))
         self.device = (cfg.get("device_id") or "").strip()
         self.venue_name = (cfg.get("venue_name") or "").strip()
         self.venue  = cfg.get("venue_type") or "dining.restaurants"
@@ -472,6 +496,8 @@ class Runner:
         self.api    = cfg.get("api_url_base") or "https://cms.flawkai.com/api/ads"
         self.play_sound = bool(cfg.get("play_sound", True))
         self.duck_other_audio = bool(cfg.get("duck_other_audio", True))
+        self.force_ipv4 = bool(cfg.get("force_ipv4", False))
+        self.http = make_session(self.force_ipv4)
         self.log    = Log(cfg.get("log_file") or "/var/log/ad_runner.log")
         ensure_dir(self.cache)
         try: os.chmod(self.cache,0o777)
@@ -490,27 +516,32 @@ class Runner:
             "venue_name": self.venue_name,
             "lat": self.lat, "lon": self.lon,
         }
+        # best-effort IPs
         ip4 = ext_ip()
         ip6 = ext_ipv6()
         if ip4: params["ip"] = ip4
-        if ip6: params["ipv6"] = ip6   # send IPv6 if available
+        if ip6: params["ipv6"] = ip6
         return self.api + "?" + up.urlencode(params)
 
     def fire(self, urls, duration=0, playhead=0, label=""):
         if not urls: return
         def worker(v):
-            for u in v:
-                try: requests.get(replace_macros(u,duration,playhead), timeout=2, headers=HEADERS)
-                except Exception: pass
+            for raw in v:
+                u = replace_macros(raw, duration, playhead)
+                try:
+                    r = self.http.get(u, timeout=3)
+                    self.log.info("Track %s -> %s  %s", label or "ping", r.status_code, u[:160])
+                except Exception as e:
+                    self.log.warn("Track %s FAILED :: %s  %s", label or "ping", e, u[:160])
         threading.Thread(target=worker, args=(list(urls),), daemon=True).start()
         if label: self.log.info("Fired %s x %d", label, len(urls))
 
     def fill_once(self):
         url = self.req_url()
-        r = requests.get(url, timeout=TIMEOUT, headers=HEADERS)
+        r = self.http.get(url, timeout=TIMEOUT)
         if r.status_code==204 or not r.content:
             time.sleep(self.poll); return False
-        parsed = follow_wrappers(r.content)
+        parsed = follow_wrappers(r.content, self.http)
         if not parsed:
             self.log.warn("VAST parse returned nothing"); time.sleep(self.poll); return False
 
@@ -538,10 +569,11 @@ class Runner:
 
         media_url = mf["url"]
         local     = download_if_needed(media_url, self.cache)
+        dur = max(1, int(parsed.get("duration") or 15))
         ad = {
             "src": media_url,
             "path": local if os.path.exists(local) else media_url,
-            "dur": max(1, int(parsed.get("duration") or 15)),
+            "dur": dur,
             "imps": parsed.get("impressions", []),
             "trk": parsed.get("trackers", {})
         }
@@ -654,8 +686,7 @@ RestartSec=3
 Environment=PYTHONUNBUFFERED=1
 Environment=DISPLAY=:0
 Environment=PULSE_SERVER=unix:/run/user/%U/pulse/native
-# Route unexpected Python stderr (e.g., crashes before logger init) to our main log.
-# Avoid duplicate info logs by discarding stdout here (Python already writes to the log_file).
+# Send unexpected stderr (before logger init) into main log; avoid stdout dupes.
 StandardOutput=null
 StandardError=append:/var/log/ad_runner.log
 
@@ -664,23 +695,24 @@ WantedBy=default.target
 UNIT
 chown "$RUN_USER:$RUN_USER" "$USER_HOME/.config/systemd/user/ad-runner.service"
 
-# ---------- ensure user bus is available, then enable & start ----------
+# ---------- Enable user bus & service ----------
 echo "== Enable user lingering and start user manager =="
 ensure_user_bus "$RUN_USER"
 
-echo "== Reload systemd (user) and enable service =="
+echo "== Reload (user) systemd & start service =="
 sudo -u "$RUN_USER" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" systemctl --user daemon-reload
 sudo -u "$RUN_USER" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" systemctl --user enable --now ad-runner.service
 
 echo
 echo "== Install complete =="
-echo "Status:"
 sudo -u "$RUN_USER" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" systemctl --user status ad-runner.service --no-pager || true
 echo
 echo "Logs:"
-echo "  Installer log: $INSTALL_LOG"
-echo "  Runner log:    $LOG_FILE"
-echo "  MPV log:       $MPV_LOG_FILE"
+echo "  Installer: $INSTALL_LOG"
+echo "  Runner:    $LOG_FILE"
+echo "  MPV:       $MPV_LOG_FILE"
 echo
-echo "To tail live logs:"
-echo "  tail -f $INSTALL_LOG $LOG_FILE $MPV_LOG_FILE"
+echo "Commands:"
+echo "  Restart:   systemctl --user restart ad-runner.service"
+echo "  Stop:      systemctl --user stop ad-runner.service"
+echo "  Logs:      tail -f $LOG_FILE $MPV_LOG_FILE"
