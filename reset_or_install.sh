@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Make interactive prompts work even when piped (curl | bash)
+# Ensure prompts work even when piped (curl | bash)
 if [ ! -t 0 ] && [ -r /dev/tty ]; then
   exec </dev/tty
 fi
@@ -12,14 +12,13 @@ CACHE_DIR="$APP_DIR/cache"
 LOCK_FILE="$APP_DIR/ad_runner.lock"
 LOG_FILE="/var/log/ad_runner.log"
 CONF_JSON="$APP_DIR/config.json"
-USER_UNIT="$HOME/.config/systemd/user/ad-runner.service"
 
 # ===== Defaults =====
 ORG_DEFAULT="golocal"
 WIDTH_DEFAULT=1920
 HEIGHT_DEFAULT=1080
-POLL_INTERVAL=3          # < 10s as required
-FILL_WINDOW=30           # seconds to fill queue
+POLL_INTERVAL=3
+FILL_WINDOW=30
 QUEUE_MAX=3
 PER_AD_COOLDOWN_DEFAULT=60
 INITIAL_DELAY_DEFAULT=60
@@ -36,7 +35,9 @@ detect_run_user() {
 }
 RUN_USER="$(detect_run_user)"
 getent passwd "$RUN_USER" >/dev/null || { echo "User '$RUN_USER' not found." >&2; exit 1; }
-user_home() { getent passwd "$RUN_USER" | cut -d: -f6; }
+USER_HOME="$(getent passwd "$RUN_USER" | cut -d: -f6)"
+echo "== Using desktop user: $RUN_USER (home: $USER_HOME) =="
+
 as_user() { sudo -u "$RUN_USER" -H bash -lc "$*"; }
 
 # ---------- Validation helpers ----------
@@ -47,8 +48,6 @@ valid_int_pos() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -gt 0 ]; }
 valid_taxonomy() { [[ "$1" =~ ^[a-z]+([._-][a-z0-9]+)+$ ]]; }  # e.g., retail.malls
 trim() { awk '{$1=$1; print}' <<<"$1"; }
 
-echo "== Using desktop user: $RUN_USER (home: $(user_home)) =="
-
 # ---------- Clean out old install ----------
 echo "== Clean out old install =="
 as_user 'systemctl --user stop ad-runner.service 2>/dev/null || true'
@@ -58,10 +57,10 @@ sudo systemctl disable ad-runner.service 2>/dev/null || true
 sudo rm -f /etc/systemd/system/ad-runner.service
 sudo systemctl daemon-reload || true
 
-rm -f "$(user_home)/.config/systemd/user/ad-runner.service" 2>/dev/null || true
-rm -f "$(user_home)/.config/autostart/flawk-ad-runner.desktop" 2>/dev/null || true
+rm -f "$USER_HOME/.config/systemd/user/ad-runner.service" 2>/dev/null || true
+rm -f "$USER_HOME/.config/autostart/flawk-ad-runner.desktop" 2>/dev/null || true
 
-pkill -f "/opt/ad-runner/ad_runner.py" 2>/dev/null || true
+pkill -f "$APP_DIR/ad_runner.py" 2>/dev/null || true
 pkill -f mpv 2>/dev/null || true
 
 sudo rm -rf "$APP_DIR" /etc/ad_runner.env
@@ -84,7 +83,7 @@ sudo chmod 0666 "$LOG_FILE"
 echo "== Prompt for configuration =="
 
 read -rp "Device ID (free-form, required): " DEVICE_ID
-[ -z "$DEVICE_ID" ] && { echo "Device ID is required"; exit 1; }  # free-form, but not empty
+[ -z "$DEVICE_ID" ] && { echo "Device ID is required"; exit 1; }
 
 VENUE_NAME=""
 while :; do
@@ -116,7 +115,7 @@ while :; do
     if [ "$VENUE_CHOICE" -eq ${#VENUE_CHOICES[@]} ]; then
       read -rp "Enter venue type (e.g., retail.malls): " VENUE_TYPE
       VENUE_TYPE="$(trim "$VENUE_TYPE")"
-      valid_taxonomy "$VENUE_TYPE" && break || echo "Invalid taxonomy. Use segments like alpha[.alpha]+ (e.g., retail.malls)"
+      valid_taxonomy "$VENUE_TYPE" && break || echo "Invalid taxonomy. Use alpha segments with dots, e.g., retail.malls"
     else
       VENUE_TYPE="${VENUE_CHOICES[$((VENUE_CHOICE-1))]}"; break
     fi
@@ -188,10 +187,10 @@ sudo chmod 0666 "$CONF_JSON"
 
 # ---------- Python venv ----------
 echo "== Create Python venv and install deps =="
-as_user "python3 -m venv '$APP_DIR/.venv'"
-as_user "'$APP_DIR/.venv/bin/pip' install --upgrade pip requests"
+sudo -u "$RUN_USER" -H python3 -m venv "$APP_DIR/.venv"
+sudo -u "$RUN_USER" -H "$APP_DIR/.venv/bin/pip" install --upgrade pip requests
 
-# ---------- Runner code ----------
+# ---------- Runner code (with ipv6 support) ----------
 echo "== Write ad_runner.py =="
 sudo tee "$APP_DIR/ad_runner.py" >/dev/null <<'PY'
 #!/usr/bin/env python3
@@ -253,7 +252,6 @@ def ext_ipv6():
             r = requests.get(url, timeout=3, headers={"User-Agent": HEADERS["User-Agent"]})
             if r.ok:
                 ip = r.text.strip()
-                # crude check: IPv6 contains ':'
                 if ":" in ip: return ip
         except Exception: pass
     return None
@@ -475,7 +473,7 @@ class Runner:
         ip4 = ext_ip()
         ip6 = ext_ipv6()
         if ip4: params["ip"] = ip4
-        if ip6: params["ipv6"] = ip6   # <-- NEW: send ipv6 in ad request
+        if ip6: params["ipv6"] = ip6   # send IPv6 if available
         return self.api + "?" + up.urlencode(params)
 
     def fire(self, urls, duration=0, playhead=0, label=""):
@@ -620,37 +618,6 @@ sudo chmod -R 0777 "$APP_DIR"
 
 # ---------- systemd user service ----------
 echo "== Create systemd user service =="
-as_user "mkdir -p ~/.config/systemd/user"
-cat > "$(user_home)/.config/systemd/user/ad-runner.service" <<UNIT
-[Unit]
-Description=Flawk Ad Runner (VAST poller + fullscreen player)
-After=graphical-session.target
-Wants=graphical-session.target
-
-[Service]
-Type=simple
-ExecStart=$APP_DIR/.venv/bin/python $APP_DIR/ad_runner.py
-WorkingDirectory=$APP_DIR
-Restart=always
-RestartSec=3
-Environment=PYTHONUNBUFFERED=1
-Environment=DISPLAY=:0
-Environment=PULSE_SERVER=unix:/run/user/%U/pulse/native
-
-[Install]
-WantedBy=default.target
-UNIT
-
-# ---------- enable & start ----------
-as_user "systemctl --user daemon-reload"
-as_user "systemctl --user enable --now ad-runner.service"
-
-# ensure it also starts without interactive login
-sudo loginctl enable-linger "$RUN_USER" >/dev/null 2>&1 || true
-
-echo "== Done =="
-echo "Status:"
-as_user "systemctl --user status ad-runner.service --no-pager || true"
-echo
-echo "Tail logs:"
-echo "  tail -f /var/log/ad_runner.log /var/log/mpv_player.log"
+mkdir -p "$USER_HOME/.config/systemd/user"
+cat > "$USER_HOME/.config/systemd/user/ad-runner.service" <<UNIT
+[Un]()
