@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ===== Install log (capture all output and errors) =====
+INSTALL_LOG="/var/log/ad_runner_install.log"
+sudo touch "$INSTALL_LOG" >/dev/null 2>&1 || true
+sudo chmod 0666 "$INSTALL_LOG" >/dev/null 2>&1 || true
+# Redirect all stdout+stderr to the install log (and to the terminal)
+exec > >(tee -a "$INSTALL_LOG") 2>&1
+
 # Ensure prompts work even when piped (curl | bash)
 if [ ! -t 0 ] && [ -r /dev/tty ]; then
   exec </dev/tty
@@ -11,6 +18,7 @@ APP_DIR="/opt/ad-runner"
 CACHE_DIR="$APP_DIR/cache"
 LOCK_FILE="$APP_DIR/ad_runner.lock"
 LOG_FILE="/var/log/ad_runner.log"
+MPV_LOG_FILE="/var/log/mpv_player.log"
 CONF_JSON="$APP_DIR/config.json"
 
 # ===== Defaults =====
@@ -76,7 +84,7 @@ pkill -f "$APP_DIR/ad_runner.py" 2>/dev/null || true
 pkill -f mpv 2>/dev/null || true
 
 sudo rm -rf "$APP_DIR" /etc/ad_runner.env
-sudo rm -f "$LOG_FILE" /var/log/mpv_player.log 2>/dev/null || true
+sudo rm -f "$LOG_FILE" "$MPV_LOG_FILE" 2>/dev/null || true
 
 # ---------- Dependencies ----------
 echo "== Install prerequisites =="
@@ -86,10 +94,10 @@ sudo apt-get install -y mpv python3 python3-venv python3-pip curl pulseaudio-uti
 # ---------- App structure ----------
 echo "== Create app structure =="
 sudo mkdir -p "$APP_DIR" "$CACHE_DIR"
-sudo touch "$LOG_FILE"
-sudo chown -R "$RUN_USER:$RUN_USER" "$APP_DIR" "$LOG_FILE"
+sudo touch "$LOG_FILE" "$MPV_LOG_FILE"
+sudo chown -R "$RUN_USER:$RUN_USER" "$APP_DIR" "$LOG_FILE" "$MPV_LOG_FILE"
 sudo chmod -R 0777 "$APP_DIR"
-sudo chmod 0666 "$LOG_FILE"
+sudo chmod 0666 "$LOG_FILE" "$MPV_LOG_FILE"
 
 # ---------- Prompts ----------
 echo "== Prompt for configuration =="
@@ -646,6 +654,10 @@ RestartSec=3
 Environment=PYTHONUNBUFFERED=1
 Environment=DISPLAY=:0
 Environment=PULSE_SERVER=unix:/run/user/%U/pulse/native
+# Route unexpected Python stderr (e.g., crashes before logger init) to our main log.
+# Avoid duplicate info logs by discarding stdout here (Python already writes to the log_file).
+StandardOutput=null
+StandardError=append:/var/log/ad_runner.log
 
 [Install]
 WantedBy=default.target
@@ -665,5 +677,10 @@ echo "== Install complete =="
 echo "Status:"
 sudo -u "$RUN_USER" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" systemctl --user status ad-runner.service --no-pager || true
 echo
-echo "Tail logs with:"
-echo "  tail -f /var/log/ad_runner.log /var/log/mpv_player.log"
+echo "Logs:"
+echo "  Installer log: $INSTALL_LOG"
+echo "  Runner log:    $LOG_FILE"
+echo "  MPV log:       $MPV_LOG_FILE"
+echo
+echo "To tail live logs:"
+echo "  tail -f $INSTALL_LOG $LOG_FILE $MPV_LOG_FILE"
