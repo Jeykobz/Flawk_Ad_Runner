@@ -620,4 +620,45 @@ sudo chmod -R 0777 "$APP_DIR"
 echo "== Create systemd user service =="
 mkdir -p "$USER_HOME/.config/systemd/user"
 cat > "$USER_HOME/.config/systemd/user/ad-runner.service" <<UNIT
-[Un]()
+[Unit]
+Description=Flawk Ad Runner (VAST poller + fullscreen player)
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=$APP_DIR/.venv/bin/python $APP_DIR/ad_runner.py
+WorkingDirectory=$APP_DIR
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+Environment=DISPLAY=:0
+Environment=PULSE_SERVER=unix:/run/user/%U/pulse/native
+
+[Install]
+WantedBy=default.target
+UNIT
+chown "$RUN_USER:$RUN_USER" "$USER_HOME/.config/systemd/user/ad-runner.service"
+
+# ---------- ensure user bus is available, then enable & start ----------
+echo "== Enable user lingering and start user manager =="
+UID_NUM=$(id -u "$RUN_USER")
+sudo loginctl enable-linger "$RUN_USER" >/dev/null 2>&1 || true
+# start user@UID (creates /run/user/UID and user bus if not present)
+if ! systemctl is-active "user@${UID_NUM}.service" >/dev/null 2>&1; then
+  sudo systemctl start "user@${UID_NUM}.service"
+  sleep 1
+fi
+export XDG_RUNTIME_DIR="/run/user/${UID_NUM}"
+
+echo "== Reload systemd (user) and enable service =="
+sudo -u "$RUN_USER" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" systemctl --user daemon-reload
+sudo -u "$RUN_USER" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" systemctl --user enable --now ad-runner.service
+
+echo
+echo "== Install complete =="
+echo "Status:"
+sudo -u "$RUN_USER" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" systemctl --user status ad-runner.service --no-pager || true
+echo
+echo "Tail logs with:"
+echo "  tail -f /var/log/ad_runner.log /var/log/mpv_player.log"
