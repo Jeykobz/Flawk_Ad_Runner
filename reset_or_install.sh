@@ -17,13 +17,13 @@ CONF_JSON="$APP_DIR/config.json"
 ORG_DEFAULT="golocal"
 WIDTH_DEFAULT=1920
 HEIGHT_DEFAULT=1080
-POLL_INTERVAL=3
+POLL_INTERVAL=3           # <10s as requested
 FILL_WINDOW=30
 QUEUE_MAX=3
 PER_AD_COOLDOWN_DEFAULT=60
 INITIAL_DELAY_DEFAULT=60
 
-# ---------- Detect the real desktop user ----------
+# ---------- Detect the real desktop/user ----------
 detect_run_user() {
   if [ "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then echo "$SUDO_USER"; return; fi
   if u=$(logname 2>/dev/null) && [ -n "$u" ] && [ "$u" != "root" ]; then echo "$u"; return; fi
@@ -47,6 +47,18 @@ valid_lon() { is_float "$1" && awk -v v="$1" 'BEGIN{exit (v<-180 || v>180)}'; }
 valid_int_pos() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -gt 0 ]; }
 valid_taxonomy() { [[ "$1" =~ ^[a-z]+([._-][a-z0-9]+)+$ ]]; }  # e.g., retail.malls
 trim() { awk '{$1=$1; print}' <<<"$1"; }
+
+# ---------- Make user bus available (prevents 'No Medium found') ----------
+ensure_user_bus() {
+  local user="$1"
+  local uid; uid=$(id -u "$user")
+  sudo loginctl enable-linger "$user" >/dev/null 2>&1 || true
+  if ! systemctl is-active "user@${uid}.service" >/dev/null 2>&1; then
+    sudo systemctl start "user@${uid}.service"
+    sleep 1
+  fi
+  export XDG_RUNTIME_DIR="/run/user/${uid}"
+}
 
 # ---------- Clean out old install ----------
 echo "== Clean out old install =="
@@ -190,7 +202,7 @@ echo "== Create Python venv and install deps =="
 sudo -u "$RUN_USER" -H python3 -m venv "$APP_DIR/.venv"
 sudo -u "$RUN_USER" -H "$APP_DIR/.venv/bin/pip" install --upgrade pip requests
 
-# ---------- Runner code (with ipv6 support) ----------
+# ---------- Runner code (with IPv6 support) ----------
 echo "== Write ad_runner.py =="
 sudo tee "$APP_DIR/ad_runner.py" >/dev/null <<'PY'
 #!/usr/bin/env python3
@@ -619,7 +631,7 @@ sudo chmod -R 0777 "$APP_DIR"
 # ---------- systemd user service ----------
 echo "== Create systemd user service =="
 mkdir -p "$USER_HOME/.config/systemd/user"
-cat > "$USER_HOME/.config/systemd/user/ad-runner.service" <<UNIT
+cat > "$USER_HOME/.config/systemd/user/ad-runner.service" <<'UNIT'
 [Unit]
 Description=Flawk Ad Runner (VAST poller + fullscreen player)
 After=graphical-session.target
@@ -627,8 +639,8 @@ Wants=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=$APP_DIR/.venv/bin/python $APP_DIR/ad_runner.py
-WorkingDirectory=$APP_DIR
+ExecStart=/opt/ad-runner/.venv/bin/python /opt/ad-runner/ad_runner.py
+WorkingDirectory=/opt/ad-runner
 Restart=always
 RestartSec=3
 Environment=PYTHONUNBUFFERED=1
@@ -642,14 +654,7 @@ chown "$RUN_USER:$RUN_USER" "$USER_HOME/.config/systemd/user/ad-runner.service"
 
 # ---------- ensure user bus is available, then enable & start ----------
 echo "== Enable user lingering and start user manager =="
-UID_NUM=$(id -u "$RUN_USER")
-sudo loginctl enable-linger "$RUN_USER" >/dev/null 2>&1 || true
-# start user@UID (creates /run/user/UID and user bus if not present)
-if ! systemctl is-active "user@${UID_NUM}.service" >/dev/null 2>&1; then
-  sudo systemctl start "user@${UID_NUM}.service"
-  sleep 1
-fi
-export XDG_RUNTIME_DIR="/run/user/${UID_NUM}"
+ensure_user_bus "$RUN_USER"
 
 echo "== Reload systemd (user) and enable service =="
 sudo -u "$RUN_USER" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" systemctl --user daemon-reload
