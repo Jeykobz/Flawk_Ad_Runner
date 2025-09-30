@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ==============================================================================
-# Flawk Ad Runner - Reset & Install (Bullet-Proof Impressions, IPv4-only)
+# Flawk Ad Runner - Reset & Install (IPv4 default, bullet-proof tracking)
 # ==============================================================================
 
 # ---------- Installer logging ----------
@@ -33,6 +33,7 @@ FILL_WINDOW=30
 QUEUE_MAX=3
 PER_AD_COOLDOWN_DEFAULT=60 # requirement: 60s per ad (configurable)
 INITIAL_DELAY_DEFAULT=60   # requirement: delay before first session
+FORCE_IPV4_DEFAULT=true    # <- IPv4 forced by default (no prompt)
 
 # ---------- Helpers ----------
 die(){ echo "ERROR: $*" >&2; exit 1; }
@@ -183,14 +184,7 @@ while :; do
   valid_int_pos "$INIT_DELAY" && break || echo "Enter a positive integer."
 done
 
-FORCE_IPV4=true
-while :; do
-  read -rp "Force IPv4 for all HTTP calls? (recommended) [Y/n]: " IPV4_ANS
-  IPV4_ANS="${IPV4_ANS:-Y}"
-  case "$IPV4_ANS" in y|Y) FORCE_IPV4=true; break ;; n|N) FORCE_IPV4=false; break ;; *) echo "Please answer Y or N." ;; esac
-done
-
-# ---------- Write config ----------
+# ---------- Write config (force IPv4 by default, no prompt) ----------
 echo "== Write config.json =="
 cat > "$CONF_JSON" <<JSON
 {
@@ -206,13 +200,13 @@ cat > "$CONF_JSON" <<JSON
   "fill_window_secs": ${FILL_WINDOW},
   "queue_max": ${QUEUE_MAX},
   "per_ad_cooldown_secs": ${COOLDOWN_PER_AD},
-  "initial_start_delay_secs": ${INIT_DELAY},
+  "initial_start_delay_secs": ${INITIAL_DELAY_DEFAULT},
   "api_url_base": "https://cms.flawkai.com/api/ads",
   "cache_dir": "$CACHE_DIR",
   "log_file": "$LOG_FILE",
   "play_sound": $PLAY_SOUND,
   "duck_other_audio": $DUCK_OTHERS,
-  "force_ipv4": $FORCE_IPV4
+  "force_ipv4": ${FORCE_IPV4_DEFAULT}
 }
 JSON
 sudo chmod 0666 "$CONF_JSON"
