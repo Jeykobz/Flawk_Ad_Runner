@@ -2,7 +2,11 @@
 set -euo pipefail
 
 # ==============================================================================
-# Flawk Ad Runner - Reset & Install (IPv4 default, bullet-proof tracking)
+# Flawk Ad Runner - Reset & Install
+# - IPv4 forced by default
+# - Bullet-proof impression caller (requests retries + curl -4 fallback)
+# - Cache capped at 1.5 GB and 30 days max age
+# - mpv log rotated (5MB x 7, compressed)
 # ==============================================================================
 
 # ---------- Installer logging ----------
@@ -25,15 +29,19 @@ LOG_FILE="/var/log/ad_runner.log"
 MPV_LOG_FILE="/var/log/mpv_player.log"
 
 # Defaults
-ORG_DEFAULT="golocal"      # per requirement
+ORG_DEFAULT="golocal"
 WIDTH_DEFAULT=1920
 HEIGHT_DEFAULT=1080
-POLL_INTERVAL=3            # < 10s (requirement 12)
+POLL_INTERVAL=3
 FILL_WINDOW=30
 QUEUE_MAX=3
-PER_AD_COOLDOWN_DEFAULT=60 # requirement: 60s per ad (configurable)
-INITIAL_DELAY_DEFAULT=60   # requirement: delay before first session
-FORCE_IPV4_DEFAULT=true    # <- IPv4 forced by default (no prompt)
+PER_AD_COOLDOWN_DEFAULT=60
+INITIAL_DELAY_DEFAULT=60
+FORCE_IPV4_DEFAULT=true
+
+# Cache policy
+CACHE_MAX_MB=1500         # 1.5 GB
+CACHE_MAX_AGE_DAYS=30     # 1 month
 
 # ---------- Helpers ----------
 die(){ echo "ERROR: $*" >&2; exit 1; }
@@ -94,7 +102,7 @@ sudo rm -f "$LOG_FILE" "$MPV_LOG_FILE" 2>/dev/null || true
 # ---------- Dependencies ----------
 echo "== Install prerequisites =="
 sudo apt-get update -y
-sudo apt-get install -y mpv python3 python3-venv python3-pip curl ca-certificates jq pulseaudio-utils
+sudo apt-get install -y mpv python3 python3-venv python3-pip curl ca-certificates jq pulseaudio-utils logrotate
 
 # ---------- App structure ----------
 echo "== Create app structure =="
@@ -184,7 +192,7 @@ while :; do
   valid_int_pos "$INIT_DELAY" && break || echo "Enter a positive integer."
 done
 
-# ---------- Write config (force IPv4 by default, no prompt) ----------
+# ---------- Write config ----------
 echo "== Write config.json =="
 cat > "$CONF_JSON" <<JSON
 {
@@ -200,7 +208,7 @@ cat > "$CONF_JSON" <<JSON
   "fill_window_secs": ${FILL_WINDOW},
   "queue_max": ${QUEUE_MAX},
   "per_ad_cooldown_secs": ${COOLDOWN_PER_AD},
-  "initial_start_delay_secs": ${INITIAL_DELAY_DEFAULT},
+  "initial_start_delay_secs": ${INIT_DELAY},
   "api_url_base": "https://cms.flawkai.com/api/ads",
   "cache_dir": "$CACHE_DIR",
   "log_file": "$LOG_FILE",
@@ -230,8 +238,12 @@ from requests.adapters import HTTPAdapter
 from urllib3.util import connection, Retry
 
 LOCK_PATH = "/opt/ad-runner/ad_runner.lock"
-HEADERS = {"User-Agent":"FlawkAdRunner/1.3 (Raspberry Pi; Linux; mpv)","Accept":"application/xml,text/xml,*/*"}
+HEADERS = {"User-Agent":"FlawkAdRunner/1.4 (Raspberry Pi; Linux; mpv)","Accept":"application/xml,text/xml,*/*"}
 TIMEOUT = 10
+
+# Cache policy
+CACHE_MAX_MB = 1500          # 1.5 GB
+CACHE_MAX_AGE_DAYS = 30      # 1 month
 
 # ----- IPv4-only adapter with retries -----
 class IPv4HTTPAdapter(HTTPAdapter):
@@ -350,6 +362,56 @@ def _media_files_from_xml_bytes(xml_bytes):
         pass
     return media
 
+# ---- Cache budget / aging (1.5 GB OR 30 days) ----
+def enforce_cache_budget(cache_dir: str, max_mb: int = CACHE_MAX_MB, max_age_days: int = CACHE_MAX_AGE_DAYS, log=None):
+    """
+    Trim cache by:
+      1) Deleting files older than max_age_days
+      2) If total size > max_mb, delete oldest until under limit
+    """
+    try:
+        p = Path(cache_dir)
+        if not p.exists():
+            return
+        files = [f for f in p.glob("*") if f.is_file()]
+        now = time.time()
+
+        # 1) Remove too-old files
+        removed = 0
+        if max_age_days and max_age_days > 0:
+            for f in files:
+                try:
+                    age_days = (now - f.stat().st_mtime) / 86400
+                    if age_days > max_age_days:
+                        f.unlink(missing_ok=True); removed += 1
+                except Exception:
+                    pass
+
+        # Re-scan and compute total
+        files = [f for f in p.glob("*") if f.is_file()]
+        total = sum((f.stat().st_size for f in files), 0)
+        limit = max_mb * 1024 * 1024
+
+        if total <= limit:
+            if log: log.info("Cache OK: %.1f MB (limit %d MB)", total/1e6, max_mb)
+            return
+
+        # 2) Trim oldest until under limit (by access time; fallback to mtime)
+        files.sort(key=lambda f: (f.stat().st_atime, f.stat().st_mtime))
+        for f in files:
+            try:
+                s = f.stat().st_size
+                f.unlink(missing_ok=True)
+                total -= s
+                removed += 1
+                if total <= limit:
+                    break
+            except Exception:
+                pass
+        if log: log.info("Cache trimmed; removed %d file(s). Current size: %.1f MB", removed, max(total/1e6,0))
+    except Exception as e:
+        if log: log.warn("Cache trim error: %s", e)
+
 def follow_wrappers(xml_bytes, session, depth=0, max_depth=4):
     if depth>max_depth: return None
     root=None
@@ -436,6 +498,7 @@ def choose_media(media_files, want_w, want_h):
     return best
 
 def download_if_needed(url:str, cache_dir:str)->str:
+    enforce_cache_budget(cache_dir)  # prune BEFORE adding
     ensure_dir(cache_dir)
     ext = os.path.splitext(up.urlparse(url).path)[1] or ".mp4"
     path = os.path.join(cache_dir, sha256_hex(url)+ext)
@@ -548,6 +611,8 @@ class Runner:
         ensure_dir(self.cache)
         try: os.chmod(self.cache,0o777)
         except PermissionError: pass
+        # Enforce cache budget at startup
+        enforce_cache_budget(self.cache, log=self.log)
         self.queue=[]
         self.first_play_done = False
         self.start_ts = time.time()
@@ -628,6 +693,9 @@ class Runner:
 
         media_url = mf["url"]
         local     = download_if_needed(media_url, self.cache)
+        # Optionally trim again after adding a file (cheap safeguard)
+        enforce_cache_budget(self.cache, log=self.log)
+
         dur = max(1, int(parsed.get("duration") or 15))
         ad = {
             "src": media_url,
@@ -771,6 +839,20 @@ ensure_user_bus "$RUN_USER"
 echo "== Reload (user) systemd & start service =="
 sudo -u "$RUN_USER" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" systemctl --user daemon-reload
 sudo -u "$RUN_USER" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" systemctl --user enable --now ad-runner.service
+
+# ---------- Logrotate for mpv ----------
+echo "== Configure logrotate for mpv_player.log =="
+sudo tee /etc/logrotate.d/flawk-mpv >/dev/null <<'ROT'
+/var/log/mpv_player.log {
+    size 5M
+    rotate 7
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+ROT
+sudo logrotate -f /etc/logrotate.d/flawk-mpv || true
 
 echo
 echo "== Install complete =="
