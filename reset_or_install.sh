@@ -119,7 +119,7 @@ read -rp "Device ID (required): " DEVICE_ID
 
 VENUE_NAME=""
 while :; do
-  read -rp "Venue name (e.g., Mall of Example): " VENUE_NAME
+  read -rp "Host name (e.g., ICCS-Fusion Nails): " VENUE_NAME
   VENUE_NAME="$(trim "$VENUE_NAME")"
   [ -n "$VENUE_NAME" ] && break || echo "Venue name cannot be empty."
 done
