@@ -534,7 +534,7 @@ class Runner:
         
         cmd = ["mpv", "--fs", "--no-border", "--really-quiet", 
                "--ontop", "--force-window=immediate", "--keep-open=no",
-               "--hwdec=mmal",
+               "--hwdec=mmal", "--vo=rpi",
                "--geometry=100%x100%", "--autofit=100%",
                "--input-default-bindings=no", "--input-vo-keyboard=no", 
                "--cursor-autohide=always", "--osc=no", "--prefetch-playlist=yes",
