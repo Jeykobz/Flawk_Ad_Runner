@@ -151,7 +151,7 @@ else
   "manifest_url": "$MANIFEST_URL",
   "width": 1920,
   "height": 1080,
-  "poll_interval_secs": 5,
+  "poll_interval_secs": 10,
   "fill_window_secs": 30,
   "queue_max": 3,
   "per_ad_cooldown_secs": 60,
