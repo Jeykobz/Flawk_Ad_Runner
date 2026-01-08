@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# FLAWK AD RUNNER - MASTER PRODUCTION INSTALLER (v0.0.5)
+# FLAWK AD RUNNER - MASTER PRODUCTION INSTALLER (v0.0.6)
 #
 # RELEASE NOTES:
-# - OPTIMIZED: VAST Parser now deduplicates tracking pixels (Fixed Double Count).
-# - VERIFIED: VAST Duration logic handles non-standard 4-part timestamps.
-# - ROBUST: Includes Legacy Fallback, Atomic Updater, and Watchdog Safety.
+# - FIXED: "play_sound" config was ignored. Now correctly passes --mute=yes to MPV.
+# - INCLUDES: VAST Smart Parser, Dedup, Legacy Fallback, Updater.
 # ==============================================================================
 
 # Strict Mode
@@ -22,7 +21,7 @@ touch "$INSTALL_LOG" >/dev/null 2>&1 || true
 chmod 0666 "$INSTALL_LOG" >/dev/null 2>&1 || true
 exec > >(tee -a "$INSTALL_LOG") 2>&1
 
-echo "=== [$(date)] Starting v0.0.5 Installation ==="
+echo "=== [$(date)] Starting v0.0.6 Installation ==="
 
 if [ ! -t 0 ] && [ -r /dev/tty ]; then exec </dev/tty; fi
 
@@ -32,7 +31,7 @@ if [ ! -t 0 ] && [ -r /dev/tty ]; then exec </dev/tty; fi
 BASE_DIR="/opt/flawk"
 DATA_DIR="$BASE_DIR/data"
 VERSIONS_DIR="$BASE_DIR/versions"
-CURRENT_VER="v0.0.5"
+CURRENT_VER="v0.0.6"
 INSTALL_DIR="$VERSIONS_DIR/$CURRENT_VER"
 LEGACY_APP_DIR="/opt/ad-runner"
 
@@ -86,7 +85,6 @@ systemctl stop ad-runner.service 2>/dev/null || true
 systemctl disable ad-runner.service 2>/dev/null || true
 rm -f /etc/systemd/system/ad-runner.service
 
-# Ghost Buster
 if sudo -u "$RUN_USER" XDG_RUNTIME_DIR="/run/user/$RUN_UID" systemctl --user is-active ad-runner.service >/dev/null 2>&1; then
     sudo -u "$RUN_USER" XDG_RUNTIME_DIR="/run/user/$RUN_UID" systemctl --user stop ad-runner.service
     sudo -u "$RUN_USER" XDG_RUNTIME_DIR="/run/user/$RUN_UID" systemctl --user disable ad-runner.service
@@ -103,10 +101,10 @@ rm -rf "$VERSIONS_DIR"
 rm -f "$BASE_DIR/current"
 
 # ==============================================================================
-# [6] DEPENDENCIES
+# [6] DEPENDENCIES (SKIPPED FOR LEGACY OS COMPATIBILITY)
 # ==============================================================================
-echo "== Phase 2: Installing Dependencies =="
-apt-get install -y mpv python3 python3-venv python3-pip curl ca-certificates jq pulseaudio-utils logrotate coreutils
+echo "== Phase 2: Dependencies =="
+apt-get install -y mpv python3 python3-venv python3-pip curl ca-certificates jq pulseaudio-utils logrotate coreutils || true
 
 # ==============================================================================
 # [7] ARCHITECTURE SETUP
@@ -132,12 +130,23 @@ if [ -f "$CONF_FILE" ]; then
     DEVICE_ID=$(jq -r .device_id "$CONF_FILE" 2>/dev/null || echo "Unknown")
 else
     echo "== Phase 4: New Configuration Required =="
-    read -rp "Device ID (required): " DEVICE_ID
+    # Force read from TTY to avoid skipped prompts
+    if [ -t 0 ]; then
+        read -rp "Device ID (required): " DEVICE_ID
+    else
+        read -rp "Device ID (required): " DEVICE_ID < /dev/tty
+    fi
+    
     [ -z "$DEVICE_ID" ] && die "Device ID is required."
 
     PLAY_SOUND=true
     while :; do
-      read -rp "Play ads with sound? [Y/n]: " SOUND_ANS
+      if [ -t 0 ]; then
+          read -rp "Play ads with sound? [Y/n]: " SOUND_ANS
+      else
+          read -rp "Play ads with sound? [Y/n]: " SOUND_ANS < /dev/tty
+      fi
+      
       SOUND_ANS="${SOUND_ANS:-Y}"
       case "$SOUND_ANS" in y|Y) PLAY_SOUND=true; break ;; n|N) PLAY_SOUND=false; break ;; *) echo "Please answer Y or N." ;; esac
     done
@@ -151,7 +160,7 @@ else
   "manifest_url": "$MANIFEST_URL",
   "width": 1920,
   "height": 1080,
-  "poll_interval_secs": 10,
+  "poll_interval_secs": 5,
   "fill_window_secs": 30,
   "queue_max": 3,
   "per_ad_cooldown_secs": 60,
@@ -175,7 +184,7 @@ sudo -u "$RUN_USER" "$INSTALL_DIR/.venv/bin/pip" install --upgrade pip requests 
 # ==============================================================================
 # [10] APPLICATION CODE
 # ==============================================================================
-echo "== Phase 6: Installing App Logic (v0.0.5) =="
+echo "== Phase 6: Installing App Logic (v0.0.6) =="
 
 sudo -u "$RUN_USER" tee "$INSTALL_DIR/ad_runner.py" >/dev/null <<'PY'
 #!/usr/bin/env python3
@@ -189,7 +198,7 @@ from urllib3.util import connection, Retry
 from xml.etree import ElementTree as ET
 
 LOCK_PATH = "/opt/ad-runner/ad_runner.lock"
-HEADERS = {"User-Agent":"FlawkAdRunner/0.0.5 (Linux; Production)","Accept":"application/xml,text/xml,*/*"}
+HEADERS = {"User-Agent":"FlawkAdRunner/0.0.6 (Linux; Production)","Accept":"application/xml,text/xml,*/*"}
 MPV_TIMEOUT_BUFFER = 40 
 
 class IPv4HTTPAdapter(HTTPAdapter):
@@ -219,7 +228,6 @@ def acquire_singleton_lock(lock_path):
 def ensure_dir(p): Path(p).mkdir(parents=True, exist_ok=True)
 def sha256_hex(s): return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
-# --- DURATION PARSING ---
 def parse_duration(t:str)->int:
     if not t: return 0
     s=str(t).strip()
@@ -230,7 +238,6 @@ def parse_duration(t:str)->int:
         colons = s.count(':')
         if colons == 3: parts = s.rsplit(':', 1); s = f"{parts[0]}.{parts[1]}"
         elif ',' in s: s = s.replace(',', '.')
-        
         if '.' in s:
             main, ms = s.split('.'); hh, mm, ss = main.split(':')
             return int(hh)*3600 + int(mm)*60 + int(ss)
@@ -255,11 +262,9 @@ def _strip_ns(tag):
     if '}' in tag: return tag.split('}', 1)[1]
     return tag
 
-# --- SMART PARSER (Wrappers + Deduplication) ---
 def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
     if depth > max_depth: return None
     result = {"media_url": None, "duration": 15, "impressions": [], "trackers": {"start":[],"firstQuartile":[],"midpoint":[],"thirdQuartile":[],"complete":[]}}
-
     try: root = ET.fromstring(xml_content)
     except: return None
 
@@ -268,7 +273,6 @@ def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
         ad_node = root.find(".//{*}Ad")
         if ad_node is None: ad_node = root.find("Ad")
     else: ad_node = root
-
     if ad_node is None: return None
 
     wrapper = ad_node.find(".//{*}Wrapper"); inline = ad_node.find(".//{*}Inline")
@@ -277,15 +281,13 @@ def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
     active_node = wrapper if wrapper is not None else inline
     if active_node is None: return None
 
-    # Harvest Impressions
-    imps = set() # Use Set for Deduplication
+    imps = set() 
     for imp in active_node.findall(".//{*}Impression"):
         if imp.text and imp.text.strip(): imps.add(imp.text.strip())
     for imp in active_node.findall("Impression"):
         if imp.text and imp.text.strip(): imps.add(imp.text.strip())
     result["impressions"] = list(imps)
 
-    # Harvest Trackers
     for trk in active_node.findall(".//{*}Tracking"):
         evt = trk.get("event")
         url = trk.text.strip() if trk.text else ""
@@ -303,7 +305,6 @@ def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
                     if child:
                         result["media_url"] = child["media_url"]
                         result["duration"] = child["duration"]
-                        # Merge and Dedup
                         result["impressions"] = list(set(result["impressions"] + child["impressions"]))
                         for k in result["trackers"]: 
                             result["trackers"][k] = list(set(result["trackers"][k] + child["trackers"][k]))
@@ -317,10 +318,8 @@ def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
             if m: result["media_url"] = m.group(1).strip()
         dn = inline.find(".//{*}Duration")
         if dn is not None and dn.text: result["duration"] = parse_duration(dn.text)
-
     return result
 
-# --- LEGACY PARSER (Regex Fallback) ---
 def parse_legacy_fallback(txt):
     media = re.search(r'MediaFile.*?><!\[CDATA\[(.*?)\]\]>', txt, re.S)
     if not media: media = re.search(r'MediaFile.*?>(http.*?)<', txt, re.S)
@@ -330,7 +329,7 @@ def parse_legacy_fallback(txt):
     return {
         "media_url": media.group(1).strip(),
         "duration": dur,
-        "impressions": list(set(re.findall(r'<Impression.*?><!\[CDATA\[(.*?)\]\]>', txt, re.S))), # Dedup
+        "impressions": list(set(re.findall(r'<Impression.*?><!\[CDATA\[(.*?)\]\]>', txt, re.S))),
         "trackers": {}
     }
 
@@ -459,10 +458,8 @@ class Runner:
             r = self.http.get(self.req_url(), timeout=10)
             if r.status_code==204 or not r.content: return False
             
-            # 1. Try Smart Parser
             vast_data = parse_vast_recursive(r.content, self.http)
             
-            # 2. Fallback
             if not vast_data or not vast_data["media_url"]:
                 self.log.warn("Smart Parse failed. Trying Legacy...")
                 vast_data = parse_legacy_fallback(r.text)
@@ -510,7 +507,9 @@ class Runner:
                     if name in ad['trk']: self.fire_delayed(offset+tsec, ad['trk'][name], name)
             offset += ad['dur']
 
-        snap = duck_others(True) if self.cfg.get("duck_other_audio") else None
+        # --- FIX: CHECK SOUND CONFIG ---
+        is_muted = not self.cfg.get("play_sound", True)
+        snap = duck_others(True) if (not is_muted and self.cfg.get("duck_other_audio")) else None
         
         subprocess.run(["pkill", "-9", "-f", "mpv --fs"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
@@ -521,7 +520,12 @@ class Runner:
                "--cursor-autohide=always", "--osc=no", "--prefetch-playlist=yes",
                "--demuxer-max-bytes=100MiB", "--demuxer-max-back-bytes=20MiB", 
                "--vd-lavc-threads=4",
-               f"--log-file=/var/log/ad-runner/mpv_player.log"] + paths
+               f"--log-file=/var/log/ad-runner/mpv_player.log"]
+        
+        if is_muted:
+            cmd.append("--mute=yes")
+
+        cmd = cmd + paths
         
         env = os.environ.copy(); env["DISPLAY"] = env.get("DISPLAY", ":0")
         
@@ -538,7 +542,7 @@ class Runner:
         return len(items)
 
     def run(self):
-        self.log.info(f"Runner Start v0.0.5. ID={self.device}")
+        self.log.info(f"Runner Start v0.0.6. ID={self.device}")
         time.sleep(self.cfg.get("initial_start_delay_secs", 10))
         while True:
             while len(self.queue) < self.cfg.get("queue_max",3):
@@ -564,7 +568,6 @@ sudo -u "$RUN_USER" tee "$INSTALL_DIR/supervisor.sh" >/dev/null <<'BASH'
 #!/bin/bash
 APP_DIR="/opt/ad-runner"
 VENV="$APP_DIR/.venv"
-# NO LOCK REMOVAL
 pkill -9 -u "$(whoami)" -f "mpv --fs" || true
 usage=$(df "$APP_DIR" | awk 'NR==2 {print $5}' | tr -d '%')
 if [ "$usage" -gt 90 ]; then rm -rf "$APP_DIR/cache/"*; fi
@@ -694,7 +697,7 @@ ln -sfn "$BASE_DIR/current" "$LEGACY_APP_DIR"
 
 tee /etc/systemd/system/ad-runner.service >/dev/null <<UNIT
 [Unit]
-Description=Flawk Ad Runner (Production v0.0.5)
+Description=Flawk Ad Runner (Production v0.0.6)
 After=network-online.target sound.target graphical-session.target
 Wants=network-online.target
 
@@ -740,8 +743,8 @@ systemctl enable --now ad-runner.service
 
 echo
 echo "=========================================="
-echo "   FLAWK AD RUNNER INSTALLED (v0.0.5)"
-echo "   - VAST Deduplication: ACTIVE"
+echo "   FLAWK AD RUNNER INSTALLED (v0.0.6)"
+echo "   - Play Sound: FIXED (Check config.json)"
 echo "=========================================="
 echo " Device ID: $DEVICE_ID"
 echo " Status:    systemctl status ad-runner"
