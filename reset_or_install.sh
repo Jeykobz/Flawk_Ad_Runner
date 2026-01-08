@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# FLAWK AD RUNNER - MASTER PRODUCTION INSTALLER (v0.0.6)
+# FLAWK AD RUNNER - MASTER PRODUCTION INSTALLER (v0.0.7)
 #
 # RELEASE NOTES:
-# - FIXED: "play_sound" config was ignored. Now correctly passes --mute=yes to MPV.
-# - INCLUDES: VAST Smart Parser, Dedup, Legacy Fallback, Updater.
+# - NEW: "Smart Media Selector". Prioritizes 1080p/720p video files if multiple
+#   bitrates are provided in the VAST response.
+# - INCLUDES: Mute Fix, VAST Wrapper Recursion, Deduplication, Updater.
 # ==============================================================================
 
 # Strict Mode
@@ -21,7 +22,7 @@ touch "$INSTALL_LOG" >/dev/null 2>&1 || true
 chmod 0666 "$INSTALL_LOG" >/dev/null 2>&1 || true
 exec > >(tee -a "$INSTALL_LOG") 2>&1
 
-echo "=== [$(date)] Starting v0.0.6 Installation ==="
+echo "=== [$(date)] Starting v0.0.7 Installation ==="
 
 if [ ! -t 0 ] && [ -r /dev/tty ]; then exec </dev/tty; fi
 
@@ -31,7 +32,7 @@ if [ ! -t 0 ] && [ -r /dev/tty ]; then exec </dev/tty; fi
 BASE_DIR="/opt/flawk"
 DATA_DIR="$BASE_DIR/data"
 VERSIONS_DIR="$BASE_DIR/versions"
-CURRENT_VER="v0.0.6"
+CURRENT_VER="v0.0.7"
 INSTALL_DIR="$VERSIONS_DIR/$CURRENT_VER"
 LEGACY_APP_DIR="/opt/ad-runner"
 
@@ -101,9 +102,9 @@ rm -rf "$VERSIONS_DIR"
 rm -f "$BASE_DIR/current"
 
 # ==============================================================================
-# [6] DEPENDENCIES (SKIPPED FOR LEGACY OS COMPATIBILITY)
+# [6] DEPENDENCIES (SKIPPED FOR LEGACY OS)
 # ==============================================================================
-echo "== Phase 2: Dependencies =="
+echo "== Phase 2: Dependencies (Skipping apt-get for safety) =="
 apt-get install -y mpv python3 python3-venv python3-pip curl ca-certificates jq pulseaudio-utils logrotate coreutils || true
 
 # ==============================================================================
@@ -130,23 +131,12 @@ if [ -f "$CONF_FILE" ]; then
     DEVICE_ID=$(jq -r .device_id "$CONF_FILE" 2>/dev/null || echo "Unknown")
 else
     echo "== Phase 4: New Configuration Required =="
-    # Force read from TTY to avoid skipped prompts
-    if [ -t 0 ]; then
-        read -rp "Device ID (required): " DEVICE_ID
-    else
-        read -rp "Device ID (required): " DEVICE_ID < /dev/tty
-    fi
-    
+    if [ -t 0 ]; then read -rp "Device ID (required): " DEVICE_ID; else read -rp "Device ID (required): " DEVICE_ID < /dev/tty; fi
     [ -z "$DEVICE_ID" ] && die "Device ID is required."
 
     PLAY_SOUND=true
     while :; do
-      if [ -t 0 ]; then
-          read -rp "Play ads with sound? [Y/n]: " SOUND_ANS
-      else
-          read -rp "Play ads with sound? [Y/n]: " SOUND_ANS < /dev/tty
-      fi
-      
+      if [ -t 0 ]; then read -rp "Play ads with sound? [Y/n]: " SOUND_ANS; else read -rp "Play ads with sound? [Y/n]: " SOUND_ANS < /dev/tty; fi
       SOUND_ANS="${SOUND_ANS:-Y}"
       case "$SOUND_ANS" in y|Y) PLAY_SOUND=true; break ;; n|N) PLAY_SOUND=false; break ;; *) echo "Please answer Y or N." ;; esac
     done
@@ -184,7 +174,7 @@ sudo -u "$RUN_USER" "$INSTALL_DIR/.venv/bin/pip" install --upgrade pip requests 
 # ==============================================================================
 # [10] APPLICATION CODE
 # ==============================================================================
-echo "== Phase 6: Installing App Logic (v0.0.6) =="
+echo "== Phase 6: Installing App Logic (v0.0.7) =="
 
 sudo -u "$RUN_USER" tee "$INSTALL_DIR/ad_runner.py" >/dev/null <<'PY'
 #!/usr/bin/env python3
@@ -198,7 +188,7 @@ from urllib3.util import connection, Retry
 from xml.etree import ElementTree as ET
 
 LOCK_PATH = "/opt/ad-runner/ad_runner.lock"
-HEADERS = {"User-Agent":"FlawkAdRunner/0.0.6 (Linux; Production)","Accept":"application/xml,text/xml,*/*"}
+HEADERS = {"User-Agent":"FlawkAdRunner/0.0.7 (Linux; Production)","Accept":"application/xml,text/xml,*/*"}
 MPV_TIMEOUT_BUFFER = 40 
 
 class IPv4HTTPAdapter(HTTPAdapter):
@@ -262,6 +252,7 @@ def _strip_ns(tag):
     if '}' in tag: return tag.split('}', 1)[1]
     return tag
 
+# --- SMART PARSER (Media Selection + Recursion) ---
 def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
     if depth > max_depth: return None
     result = {"media_url": None, "duration": 15, "impressions": [], "trackers": {"start":[],"firstQuartile":[],"midpoint":[],"thirdQuartile":[],"complete":[]}}
@@ -310,12 +301,40 @@ def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
                             result["trackers"][k] = list(set(result["trackers"][k] + child["trackers"][k]))
             except: pass
     elif inline is not None:
+        # --- NEW: Smart Media Selection Logic ---
+        candidates = []
         for mf in inline.findall(".//{*}MediaFile"):
-            u = mf.text.strip() if mf.text else ""; typ = mf.get("type", "").lower()
-            if "mp4" in typ or u.endswith(".mp4"): result["media_url"] = u; break
-        if not result["media_url"]:
+            u = mf.text.strip() if mf.text else ""
+            if not u: continue
+            
+            typ = mf.get("type", "").lower()
+            # Loose MP4 check
+            if "mp4" not in typ and not u.endswith(".mp4"): continue
+                
+            w_str, h_str = mf.get("width"), mf.get("height")
+            try: w = int(w_str) if w_str else 0; h = int(h_str) if h_str else 0
+            except: w, h = 0, 0
+            
+            candidates.append({"url": u, "w": w, "h": h})
+
+        if not candidates:
+            # Fallback regex
             m = re.search(r'MediaFile.*?><!\[CDATA\[(.*?)\]\]>', xml_content.decode('utf-8', 'ignore'), re.S)
             if m: result["media_url"] = m.group(1).strip()
+        elif len(candidates) == 1:
+            result["media_url"] = candidates[0]["url"]
+        else:
+            # Sort by closeness to 1080p or 720p
+            # Score = min( abs(h-720), abs(h-1080) )
+            # If height is 0, penalty score is applied to push to bottom
+            def score_fn(c):
+                h = c["h"]
+                if h <= 0: return 999999
+                return min(abs(h - 720), abs(h - 1080))
+            
+            candidates.sort(key=score_fn)
+            result["media_url"] = candidates[0]["url"]
+
         dn = inline.find(".//{*}Duration")
         if dn is not None and dn.text: result["duration"] = parse_duration(dn.text)
     return result
@@ -522,9 +541,7 @@ class Runner:
                "--vd-lavc-threads=4",
                f"--log-file=/var/log/ad-runner/mpv_player.log"]
         
-        if is_muted:
-            cmd.append("--mute=yes")
-
+        if is_muted: cmd.append("--mute=yes")
         cmd = cmd + paths
         
         env = os.environ.copy(); env["DISPLAY"] = env.get("DISPLAY", ":0")
@@ -542,7 +559,7 @@ class Runner:
         return len(items)
 
     def run(self):
-        self.log.info(f"Runner Start v0.0.6. ID={self.device}")
+        self.log.info(f"Runner Start v0.0.7. ID={self.device}")
         time.sleep(self.cfg.get("initial_start_delay_secs", 10))
         while True:
             while len(self.queue) < self.cfg.get("queue_max",3):
@@ -568,6 +585,7 @@ sudo -u "$RUN_USER" tee "$INSTALL_DIR/supervisor.sh" >/dev/null <<'BASH'
 #!/bin/bash
 APP_DIR="/opt/ad-runner"
 VENV="$APP_DIR/.venv"
+# NO LOCK REMOVAL
 pkill -9 -u "$(whoami)" -f "mpv --fs" || true
 usage=$(df "$APP_DIR" | awk 'NR==2 {print $5}' | tr -d '%')
 if [ "$usage" -gt 90 ]; then rm -rf "$APP_DIR/cache/"*; fi
@@ -697,7 +715,7 @@ ln -sfn "$BASE_DIR/current" "$LEGACY_APP_DIR"
 
 tee /etc/systemd/system/ad-runner.service >/dev/null <<UNIT
 [Unit]
-Description=Flawk Ad Runner (Production v0.0.6)
+Description=Flawk Ad Runner (Production v0.0.7)
 After=network-online.target sound.target graphical-session.target
 Wants=network-online.target
 
@@ -743,8 +761,9 @@ systemctl enable --now ad-runner.service
 
 echo
 echo "=========================================="
-echo "   FLAWK AD RUNNER INSTALLED (v0.0.6)"
-echo "   - Play Sound: FIXED (Check config.json)"
+echo "   FLAWK AD RUNNER INSTALLED (v0.0.7)"
+echo "   - Smart Resolution Picker: ACTIVE"
+echo "   - Mute Logic: FIXED"
 echo "=========================================="
 echo " Device ID: $DEVICE_ID"
 echo " Status:    systemctl status ad-runner"
