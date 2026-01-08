@@ -324,13 +324,13 @@ def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
         elif len(candidates) == 1:
             result["media_url"] = candidates[0]["url"]
         else:
-            # Sort by closeness to 1080p or 720p
-            # Score = min( abs(h-720), abs(h-1080) )
+            # Sort by closeness to 480p or 720p
+            # Score = min( abs(h-720), abs(h-480) )
             # If height is 0, penalty score is applied to push to bottom
             def score_fn(c):
                 h = c["h"]
                 if h <= 0: return 999999
-                return min(abs(h - 720), abs(h - 1080))
+                return min(abs(h - 720), abs(h - 480))
             
             candidates.sort(key=score_fn)
             result["media_url"] = candidates[0]["url"]
@@ -534,7 +534,6 @@ class Runner:
         
         cmd = ["mpv", "--fs", "--no-border", "--really-quiet", 
                "--ontop", "--force-window=immediate", "--keep-open=no",
-               "--hwdec=mmal", "--vo=rpi",
                "--geometry=100%x100%", "--autofit=100%",
                "--input-default-bindings=no", "--input-vo-keyboard=no", 
                "--cursor-autohide=always", "--osc=no", "--prefetch-playlist=yes",
