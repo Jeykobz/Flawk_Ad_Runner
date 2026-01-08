@@ -106,7 +106,6 @@ rm -f "$BASE_DIR/current"
 # [6] DEPENDENCIES
 # ==============================================================================
 echo "== Phase 2: Installing Dependencies =="
-apt-get update -y
 apt-get install -y mpv python3 python3-venv python3-pip curl ca-certificates jq pulseaudio-utils logrotate coreutils
 
 # ==============================================================================
