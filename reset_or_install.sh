@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# FLAWK AD RUNNER - MASTER PRODUCTION INSTALLER (v0.0.7)
+# FLAWK AD RUNNER - MASTER PRODUCTION INSTALLER (v0.0.14)
 #
 # RELEASE NOTES:
-# - NEW: "Smart Media Selector". Prioritizes 1080p/720p video files if multiple
-#   bitrates are provided in the VAST response.
-# - INCLUDES: Mute Fix, VAST Wrapper Recursion, Deduplication, Updater.
+# - PERFORMANCE: "Lean MPV". Removed heavy flags (prefetch, huge buffers,
+#   forced geometry) that were causing stutter on Pi 3/4.
+# - OPTIMIZATION: Added '--x11-bypass-compositor=yes' to disable GUI effects
+#   during playback.
+# - INCLUDES: RAM Playback, Priority Boost, Safe Mode, Updater.
 # ==============================================================================
 
 # Strict Mode
@@ -22,7 +24,7 @@ touch "$INSTALL_LOG" >/dev/null 2>&1 || true
 chmod 0666 "$INSTALL_LOG" >/dev/null 2>&1 || true
 exec > >(tee -a "$INSTALL_LOG") 2>&1
 
-echo "=== [$(date)] Starting v0.0.7 Installation ==="
+echo "=== [$(date)] Starting v0.0.14 (Lean MPV) Installation ==="
 
 if [ ! -t 0 ] && [ -r /dev/tty ]; then exec </dev/tty; fi
 
@@ -32,7 +34,7 @@ if [ ! -t 0 ] && [ -r /dev/tty ]; then exec </dev/tty; fi
 BASE_DIR="/opt/flawk"
 DATA_DIR="$BASE_DIR/data"
 VERSIONS_DIR="$BASE_DIR/versions"
-CURRENT_VER="v0.0.7"
+CURRENT_VER="v0.0.14"
 INSTALL_DIR="$VERSIONS_DIR/$CURRENT_VER"
 LEGACY_APP_DIR="/opt/ad-runner"
 
@@ -102,9 +104,9 @@ rm -rf "$VERSIONS_DIR"
 rm -f "$BASE_DIR/current"
 
 # ==============================================================================
-# [6] DEPENDENCIES (SKIPPED FOR LEGACY OS)
+# [6] DEPENDENCIES (Safe Mode)
 # ==============================================================================
-echo "== Phase 2: Dependencies (Skipping apt-get for safety) =="
+echo "== Phase 2: Dependencies (Safe Mode) =="
 apt-get install -y mpv python3 python3-venv python3-pip curl ca-certificates jq pulseaudio-utils logrotate coreutils || true
 
 # ==============================================================================
@@ -174,11 +176,11 @@ sudo -u "$RUN_USER" "$INSTALL_DIR/.venv/bin/pip" install --upgrade pip requests 
 # ==============================================================================
 # [10] APPLICATION CODE
 # ==============================================================================
-echo "== Phase 6: Installing App Logic (v0.0.7) =="
+echo "== Phase 6: Installing App Logic (v0.0.14) =="
 
 sudo -u "$RUN_USER" tee "$INSTALL_DIR/ad_runner.py" >/dev/null <<'PY'
 #!/usr/bin/env python3
-import os, sys, time, json, random, hashlib, threading, subprocess, logging, logging.handlers, fcntl, re, socket
+import os, sys, time, json, random, hashlib, threading, subprocess, logging, logging.handlers, fcntl, re, socket, shutil
 import concurrent.futures
 import urllib.parse as up
 from pathlib import Path
@@ -188,8 +190,9 @@ from urllib3.util import connection, Retry
 from xml.etree import ElementTree as ET
 
 LOCK_PATH = "/opt/ad-runner/ad_runner.lock"
-HEADERS = {"User-Agent":"FlawkAdRunner/0.0.7 (Linux; Production)","Accept":"application/xml,text/xml,*/*"}
-MPV_TIMEOUT_BUFFER = 40 
+HEADERS = {"User-Agent":"FlawkAdRunner/0.0.14 (Linux; Production)","Accept":"application/xml,text/xml,*/*"}
+MPV_TIMEOUT_BUFFER = 60
+RAM_DISK_PATH = "/dev/shm" 
 
 class IPv4HTTPAdapter(HTTPAdapter):
     def init_poolmanager(self, *args, **kwargs):
@@ -252,7 +255,6 @@ def _strip_ns(tag):
     if '}' in tag: return tag.split('}', 1)[1]
     return tag
 
-# --- SMART PARSER (Media Selection + Recursion) ---
 def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
     if depth > max_depth: return None
     result = {"media_url": None, "duration": 15, "impressions": [], "trackers": {"start":[],"firstQuartile":[],"midpoint":[],"thirdQuartile":[],"complete":[]}}
@@ -301,37 +303,28 @@ def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
                             result["trackers"][k] = list(set(result["trackers"][k] + child["trackers"][k]))
             except: pass
     elif inline is not None:
-        # --- NEW: Smart Media Selection Logic ---
         candidates = []
         for mf in inline.findall(".//{*}MediaFile"):
             u = mf.text.strip() if mf.text else ""
             if not u: continue
-            
             typ = mf.get("type", "").lower()
-            # Loose MP4 check
             if "mp4" not in typ and not u.endswith(".mp4"): continue
-                
             w_str, h_str = mf.get("width"), mf.get("height")
             try: w = int(w_str) if w_str else 0; h = int(h_str) if h_str else 0
             except: w, h = 0, 0
-            
             candidates.append({"url": u, "w": w, "h": h})
 
         if not candidates:
-            # Fallback regex
             m = re.search(r'MediaFile.*?><!\[CDATA\[(.*?)\]\]>', xml_content.decode('utf-8', 'ignore'), re.S)
             if m: result["media_url"] = m.group(1).strip()
         elif len(candidates) == 1:
             result["media_url"] = candidates[0]["url"]
         else:
-            # Sort by closeness to 480p or 720p
-            # Score = min( abs(h-720), abs(h-480) )
-            # If height is 0, penalty score is applied to push to bottom
             def score_fn(c):
                 h = c["h"]
                 if h <= 0: return 999999
+                # Priority: 720p or 480p (Safe for CPU)
                 return min(abs(h - 720), abs(h - 480))
-            
             candidates.sort(key=score_fn)
             result["media_url"] = candidates[0]["url"]
 
@@ -508,13 +501,26 @@ class Runner:
         if not self.queue: return 0
         items = list(self.queue); self.queue.clear()
         paths = []
+        ram_files = [] 
+        
         total_sec = 0
+        
+        # --- RAM PLAYBACK: Copy to /dev/shm ---
         for ad in items:
             total_sec += ad['dur']
-            if os.path.exists(ad['path']):
-                Path(ad['path']).touch()
-                paths.append(ad['path'])
-            else: paths.append(ad['src'])
+            src_path = ad['path'] if os.path.exists(ad['path']) else None
+            if src_path:
+                Path(src_path).touch()
+                base = os.path.basename(src_path)
+                ram_path = os.path.join(RAM_DISK_PATH, f"flawk_{base}")
+                try:
+                    shutil.copyfile(src_path, ram_path)
+                    paths.append(ram_path)
+                    ram_files.append(ram_path)
+                except:
+                    paths.append(src_path)
+            else:
+                paths.append(ad['src'])
         
         offset = 0
         for ad in items:
@@ -526,20 +532,12 @@ class Runner:
                     if name in ad['trk']: self.fire_delayed(offset+tsec, ad['trk'][name], name)
             offset += ad['dur']
 
-        # --- FIX: CHECK SOUND CONFIG ---
         is_muted = not self.cfg.get("play_sound", True)
         snap = duck_others(True) if (not is_muted and self.cfg.get("duck_other_audio")) else None
         
         subprocess.run(["pkill", "-9", "-f", "mpv --fs"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
-        /*cmd = ["mpv", "--fs", "--no-border", "--really-quiet", 
-               "--ontop", "--force-window=immediate", "--keep-open=no",
-               "--geometry=100%x100%", "--autofit=100%",
-               "--input-default-bindings=no", "--input-vo-keyboard=no", 
-               "--cursor-autohide=always", "--osc=no", "--prefetch-playlist=yes",
-               "--demuxer-max-bytes=100MiB", "--demuxer-max-back-bytes=20MiB", 
-               "--vd-lavc-threads=4",
-               f"--log-file=/var/log/ad-runner/mpv_player.log"]*/
+        # --- LEAN MPV COMMAND (NO FLUFF) ---
         cmd = ["mpv", "--fs", "--no-border", "--really-quiet", 
                "--ontop", "--keep-open=no",
                "--input-default-bindings=no", "--input-vo-keyboard=no", 
@@ -554,7 +552,7 @@ class Runner:
         env = os.environ.copy(); env["DISPLAY"] = env.get("DISPLAY", ":0")
         
         TIMEOUT_VAL = total_sec + MPV_TIMEOUT_BUFFER
-        self.log.info(f"Playing Batch. Total: {total_sec}s. Watchdog: {TIMEOUT_VAL}s")
+        self.log.info(f"Playing Batch (RAM + Lean). Total: {total_sec}s.")
 
         try:
             subprocess.run(cmd, env=env, check=False, timeout=TIMEOUT_VAL)
@@ -563,21 +561,26 @@ class Runner:
             subprocess.run(["pkill", "-9", "-f", "mpv --fs"], stdout=subprocess.DEVNULL)
         
         if snap: duck_others(False, snap)
+        
+        for rf in ram_files:
+            try: os.remove(rf)
+            except: pass
+            
         return len(items)
 
     def run(self):
-        self.log.info(f"Runner Start v0.0.7. ID={self.device}")
+        self.log.info(f"Runner Start v0.0.14. ID={self.device}")
         time.sleep(self.cfg.get("initial_start_delay_secs", 10))
         while True:
-            while len(self.queue) < self.cfg.get("queue_max",3):
+            while len(self.queue) < self.cfg.get("queue_max",5):
                 if not self.fill_once(): break
                 time.sleep(1)
             
             if self.queue:
                 played = self.play_queue()
-                time.sleep(self.cfg.get("per_ad_cooldown_secs", 60) * played)
+                time.sleep(self.cfg.get("per_ad_cooldown_secs", 30) * played)
             else:
-                time.sleep(self.cfg.get("poll_interval_secs", 5))
+                time.sleep(self.cfg.get("poll_interval_secs", 10))
 
 if __name__=="__main__":
     _lock = acquire_singleton_lock(LOCK_PATH)
@@ -722,7 +725,7 @@ ln -sfn "$BASE_DIR/current" "$LEGACY_APP_DIR"
 
 tee /etc/systemd/system/ad-runner.service >/dev/null <<UNIT
 [Unit]
-Description=Flawk Ad Runner (Production v0.0.7)
+Description=Flawk Ad Runner (Production v0.0.14)
 After=network-online.target sound.target graphical-session.target
 Wants=network-online.target
 
@@ -738,6 +741,10 @@ StartLimitBurst=10
 StartLimitIntervalSec=60
 MemoryMax=768M
 CPUWeight=50
+# PRIORITY
+Nice=-15
+IOSchedulingClass=realtime
+IOSchedulingPriority=2
 Environment=DISPLAY=:0
 Environment=XDG_RUNTIME_DIR=/run/user/$RUN_UID
 StandardOutput=append:$LOG_DIR/service.log
@@ -768,9 +775,9 @@ systemctl enable --now ad-runner.service
 
 echo
 echo "=========================================="
-echo "   FLAWK AD RUNNER INSTALLED (v0.0.7)"
-echo "   - Smart Resolution Picker: ACTIVE"
-echo "   - Mute Logic: FIXED"
+echo "   FLAWK AD RUNNER INSTALLED (v0.0.14)"
+echo "   - Lean MPV: ACTIVE (No bloat flags)"
+echo "   - Compositor Bypass: ON"
 echo "=========================================="
 echo " Device ID: $DEVICE_ID"
 echo " Status:    systemctl status ad-runner"
