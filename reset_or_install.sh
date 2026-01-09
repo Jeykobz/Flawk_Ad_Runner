@@ -532,13 +532,20 @@ class Runner:
         
         subprocess.run(["pkill", "-9", "-f", "mpv --fs"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
-        cmd = ["mpv", "--fs", "--no-border", "--really-quiet", 
+        /*cmd = ["mpv", "--fs", "--no-border", "--really-quiet", 
                "--ontop", "--force-window=immediate", "--keep-open=no",
                "--geometry=100%x100%", "--autofit=100%",
                "--input-default-bindings=no", "--input-vo-keyboard=no", 
                "--cursor-autohide=always", "--osc=no", "--prefetch-playlist=yes",
                "--demuxer-max-bytes=100MiB", "--demuxer-max-back-bytes=20MiB", 
                "--vd-lavc-threads=4",
+               f"--log-file=/var/log/ad-runner/mpv_player.log"]*/
+        cmd = ["mpv", "--fs", "--no-border", "--really-quiet", 
+               "--ontop", "--keep-open=no",
+               "--input-default-bindings=no", "--input-vo-keyboard=no", 
+               "--cursor-autohide=always", "--osc=no", 
+               # No prefetch, no geometry, no lavc-threads
+               "--x11-bypass-compositor=yes",  # <--- COMPOSITOR BYPASS
                f"--log-file=/var/log/ad-runner/mpv_player.log"]
         
         if is_muted: cmd.append("--mute=yes")
