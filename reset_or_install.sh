@@ -542,8 +542,11 @@ class Runner:
                "--ontop", "--keep-open=no",
                "--input-default-bindings=no", "--input-vo-keyboard=no", 
                "--cursor-autohide=always", "--osc=no", 
-               # No prefetch, no geometry, no lavc-threads
-               "--x11-bypass-compositor=yes",  # <--- COMPOSITOR BYPASS
+               "--x11-bypass-compositor=yes",
+               # FAST DECODING FOR CPU
+               "--vd-lavc-skiploopfilter=all",
+               "--vd-lavc-fast",
+               "--framedrop=vo",
                f"--log-file=/var/log/ad-runner/mpv_player.log"]
         
         if is_muted: cmd.append("--mute=yes")
