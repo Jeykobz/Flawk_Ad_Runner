@@ -1,18 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# FLAWK AD RUNNER - MASTER PRODUCTION INSTALLER (v0.0.21)
+# FLAWK AD RUNNER - MASTER PRODUCTION INSTALLER (v0.0.22)
 #
 # RELEASE NOTES:
-# - CPU TUNING: "Lightweight CPU Mode".
-#   1. Audio: Default (PulseAudio) - No ALSA bypass.
-#   2. Decoder: CPU Only (Software).
-#   3. Optimizations:
-#      - 'fast-bilinear' scaling (Fastest resize).
-#      - 'skiploopfilter=all' (Disables deblocking to save 30% CPU).
-#      - 'threads=2' (Capped to prevent starving background apps).
-#      - 'framedrop=decoder' (Aggressive skip if lagging).
-#      - 'vo=x11' (Low overhead display).
-# - INCLUDES: RAM Playback, Priority Boost (Nice=-15), RAM Cleaning.
+# - COLOR FIX: Switched output from '--vo=x11' to '--vo=sdl'.
+#   (Fixes "Psychedelic/Inverted Colors" by using SDL's reliable color conversion).
+# - QUALITY TWEAK: Changed scaler to 'bilinear' (removes 'fast-' artifacts).
+# - RETAINED: CPU Optimizations (Threads=2, SkipLoopFilter, FrameDrop).
+# - INCLUDES: RAM Playback, Priority Boost (Nice -15), RAM Cleaning.
 # ==============================================================================
 
 # Strict Mode
@@ -29,7 +24,7 @@ touch "$INSTALL_LOG" >/dev/null 2>&1 || true
 chmod 0666 "$INSTALL_LOG" >/dev/null 2>&1 || true
 exec > >(tee -a "$INSTALL_LOG") 2>&1
 
-echo "=== [$(date)] Starting v0.0.21 (Lightweight CPU) Installation ==="
+echo "=== [$(date)] Starting v0.0.22 (Safe Color Mode) Installation ==="
 
 if [ ! -t 0 ] && [ -r /dev/tty ]; then exec </dev/tty; fi
 
@@ -39,7 +34,7 @@ if [ ! -t 0 ] && [ -r /dev/tty ]; then exec </dev/tty; fi
 BASE_DIR="/opt/flawk"
 DATA_DIR="$BASE_DIR/data"
 VERSIONS_DIR="$BASE_DIR/versions"
-CURRENT_VER="v0.0.21"
+CURRENT_VER="v0.0.22"
 INSTALL_DIR="$VERSIONS_DIR/$CURRENT_VER"
 LEGACY_APP_DIR="/opt/ad-runner"
 
@@ -181,7 +176,7 @@ sudo -u "$RUN_USER" "$INSTALL_DIR/.venv/bin/pip" install --upgrade pip requests 
 # ==============================================================================
 # [10] APPLICATION CODE
 # ==============================================================================
-echo "== Phase 6: Installing App Logic (v0.0.21) =="
+echo "== Phase 6: Installing App Logic (v0.0.22) =="
 
 sudo -u "$RUN_USER" tee "$INSTALL_DIR/ad_runner.py" >/dev/null <<'PY'
 #!/usr/bin/env python3
@@ -195,7 +190,7 @@ from urllib3.util import connection, Retry
 from xml.etree import ElementTree as ET
 
 LOCK_PATH = "/opt/ad-runner/ad_runner.lock"
-HEADERS = {"User-Agent":"FlawkAdRunner/0.0.21 (Linux; Production)","Accept":"application/xml,text/xml,*/*"}
+HEADERS = {"User-Agent":"FlawkAdRunner/0.0.22 (Linux; Production)","Accept":"application/xml,text/xml,*/*"}
 MPV_TIMEOUT_BUFFER = 60
 RAM_DISK_PATH = "/dev/shm" 
 
@@ -543,21 +538,21 @@ class Runner:
         
         subprocess.run(["pkill", "-9", "-f", "mpv --fs"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
-        # --- LIGHTWEIGHT CPU MODE ---
+        # --- COLOR FIX MODE: SDL OUTPUT ---
         cmd = ["mpv", "--fs", "--no-border", "--really-quiet", 
                "--ontop", "--keep-open=no",
                "--input-default-bindings=no", "--input-vo-keyboard=no", 
                "--cursor-autohide=always", "--osc=no", 
                "--x11-bypass-compositor=yes",
                
-               # --- OPTIMIZATIONS ---
-               "--sws-scaler=fast-bilinear", # Fast resize
-               "--vd-lavc-skiploopfilter=all", # Skip deblocking (Major CPU Saver)
-               "--vd-lavc-fast", # Allow fast decoding
-               "--framedrop=decoder", # Skip decode if late
-               "--vd-lavc-threads=2", # Safety cap for background app
-               "--vo=x11", # Low overhead output
-               # ---------------------
+               # --- OPTIMIZATIONS + COLOR FIX ---
+               "--vo=sdl",                   # 1. FIXES COLORS
+               "--sws-scaler=bilinear",      # 2. Removes 'Fast' artifacts
+               "--vd-lavc-skiploopfilter=all",
+               "--vd-lavc-fast", 
+               "--framedrop=decoder", 
+               "--vd-lavc-threads=2", 
+               # ---------------------------------
                
                f"--log-file=/var/log/ad-runner/mpv_player.log"]
         
@@ -567,7 +562,7 @@ class Runner:
         env = os.environ.copy(); env["DISPLAY"] = env.get("DISPLAY", ":0")
         
         TIMEOUT_VAL = total_sec + MPV_TIMEOUT_BUFFER
-        self.log.info(f"Playing Batch (Lightweight CPU). Total: {total_sec}s.")
+        self.log.info(f"Playing Batch (SDL Mode). Total: {total_sec}s.")
 
         try:
             subprocess.run(cmd, env=env, check=False, timeout=TIMEOUT_VAL)
@@ -582,7 +577,7 @@ class Runner:
         return len(items)
 
     def run(self):
-        self.log.info(f"Runner Start v0.0.21. ID={self.device}")
+        self.log.info(f"Runner Start v0.0.22. ID={self.device}")
         time.sleep(self.cfg.get("initial_start_delay_secs", 10))
         while True:
             while len(self.queue) < self.cfg.get("queue_max",5):
@@ -739,7 +734,7 @@ ln -sfn "$BASE_DIR/current" "$LEGACY_APP_DIR"
 # PRIORITY
 tee /etc/systemd/system/ad-runner.service >/dev/null <<UNIT
 [Unit]
-Description=Flawk Ad Runner (Production v0.0.21)
+Description=Flawk Ad Runner (Production v0.0.22)
 After=network-online.target sound.target graphical-session.target
 Wants=network-online.target
 
@@ -789,10 +784,9 @@ systemctl enable --now ad-runner.service
 
 echo
 echo "=========================================="
-echo "   FLAWK AD RUNNER INSTALLED (v0.0.21)"
-echo "   - CPU Optimizations: ACTIVE"
-echo "   - Threads: 2 (Safe)"
-echo "   - Audio: PulseAudio (Standard)"
+echo "   FLAWK AD RUNNER INSTALLED (v0.0.22)"
+echo "   - Mode: Safe Color (SDL Output)"
+echo "   - Critical: Disconnect AnyDesk for Smoothness"
 echo "=========================================="
 echo " Device ID: $DEVICE_ID"
 echo " Status:    systemctl status ad-runner"
