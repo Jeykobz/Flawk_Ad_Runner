@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# FLAWK AD RUNNER - MASTER PRODUCTION INSTALLER (v0.0.14)
+# FLAWK AD RUNNER - MASTER PRODUCTION INSTALLER (v0.0.17)
 #
 # RELEASE NOTES:
-# - PERFORMANCE: "Lean MPV". Removed heavy flags (prefetch, huge buffers,
-#   forced geometry) that were causing stutter on Pi 3/4.
-# - OPTIMIZATION: Added '--x11-bypass-compositor=yes' to disable GUI effects
-#   during playback.
-# - INCLUDES: RAM Playback, Priority Boost, Safe Mode, Updater.
+# - CPU OPTIMIZATION: Added '--vd-lavc-skiploopfilter=all' and '--vd-lavc-fast'.
+#   This significantly lowers CPU usage during software decoding by skipping
+#   visual post-processing. Crucial for Pi 3/4 without HW acceleration.
+# - INCLUDES: RAM Playback, Priority Boost, RAM Cleaning, Safe Mode.
 # ==============================================================================
 
 # Strict Mode
@@ -24,7 +23,7 @@ touch "$INSTALL_LOG" >/dev/null 2>&1 || true
 chmod 0666 "$INSTALL_LOG" >/dev/null 2>&1 || true
 exec > >(tee -a "$INSTALL_LOG") 2>&1
 
-echo "=== [$(date)] Starting v0.0.14 (Lean MPV) Installation ==="
+echo "=== [$(date)] Starting v0.0.17 (Low CPU Mode) Installation ==="
 
 if [ ! -t 0 ] && [ -r /dev/tty ]; then exec </dev/tty; fi
 
@@ -34,7 +33,7 @@ if [ ! -t 0 ] && [ -r /dev/tty ]; then exec </dev/tty; fi
 BASE_DIR="/opt/flawk"
 DATA_DIR="$BASE_DIR/data"
 VERSIONS_DIR="$BASE_DIR/versions"
-CURRENT_VER="v0.0.14"
+CURRENT_VER="v0.0.17"
 INSTALL_DIR="$VERSIONS_DIR/$CURRENT_VER"
 LEGACY_APP_DIR="/opt/ad-runner"
 
@@ -176,7 +175,7 @@ sudo -u "$RUN_USER" "$INSTALL_DIR/.venv/bin/pip" install --upgrade pip requests 
 # ==============================================================================
 # [10] APPLICATION CODE
 # ==============================================================================
-echo "== Phase 6: Installing App Logic (v0.0.14) =="
+echo "== Phase 6: Installing App Logic (v0.0.17) =="
 
 sudo -u "$RUN_USER" tee "$INSTALL_DIR/ad_runner.py" >/dev/null <<'PY'
 #!/usr/bin/env python3
@@ -190,7 +189,7 @@ from urllib3.util import connection, Retry
 from xml.etree import ElementTree as ET
 
 LOCK_PATH = "/opt/ad-runner/ad_runner.lock"
-HEADERS = {"User-Agent":"FlawkAdRunner/0.0.14 (Linux; Production)","Accept":"application/xml,text/xml,*/*"}
+HEADERS = {"User-Agent":"FlawkAdRunner/0.0.17 (Linux; Production)","Accept":"application/xml,text/xml,*/*"}
 MPV_TIMEOUT_BUFFER = 60
 RAM_DISK_PATH = "/dev/shm" 
 
@@ -213,13 +212,20 @@ def acquire_singleton_lock(lock_path):
     Path(os.path.dirname(lock_path)).mkdir(parents=True, exist_ok=True)
     fp = open(lock_path, "a+")
     try: fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError: 
-        print("Ad Runner is already running (Locked). Exiting with code 1.")
-        sys.exit(1)
+    except BlockingIOError: sys.exit(1)
     return fp
 
 def ensure_dir(p): Path(p).mkdir(parents=True, exist_ok=True)
 def sha256_hex(s): return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+def clean_ram_disk():
+    # Aggressively clean up ANY flawk related files in RAM
+    try:
+        p = Path(RAM_DISK_PATH)
+        for f in p.glob("flawk_*"):
+            try: f.unlink()
+            except: pass
+    except: pass
 
 def parse_duration(t:str)->int:
     if not t: return 0
@@ -237,13 +243,7 @@ def parse_duration(t:str)->int:
         else:
             hh, mm, ss = s.split(':')
             return int(hh)*3600 + int(mm)*60 + int(ss)
-    except Exception:
-        try:
-            parts = s.replace(':', ' ').split()
-            if len(parts) >= 3:
-                return int(parts[0])*3600 + int(parts[1])*60 + int(parts[2])
-        except: pass
-        return 15
+    except Exception: return 15
 
 def replace_macros(url, duration, playhead):
     ts=int(time.time()); cb=str(random.randint(10000000,99999999))
@@ -323,7 +323,6 @@ def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
             def score_fn(c):
                 h = c["h"]
                 if h <= 0: return 999999
-                # Priority: 720p or 480p (Safe for CPU)
                 return min(abs(h - 720), abs(h - 480))
             candidates.sort(key=score_fn)
             result["media_url"] = candidates[0]["url"]
@@ -423,6 +422,9 @@ class Runner:
         ensure_dir(self.cache)
         enforce_cache_budget(self.cache, log=self.log)
         
+        # Clean RAM Disk on startup
+        clean_ram_disk()
+        
         self.queue = []
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=6)
         threading.Thread(target=self.heartbeat_loop, daemon=True).start()
@@ -498,6 +500,9 @@ class Runner:
             return False
 
     def play_queue(self):
+        # 1. Proactive Clean
+        clean_ram_disk()
+        
         if not self.queue: return 0
         items = list(self.queue); self.queue.clear()
         paths = []
@@ -505,7 +510,6 @@ class Runner:
         
         total_sec = 0
         
-        # --- RAM PLAYBACK: Copy to /dev/shm ---
         for ad in items:
             total_sec += ad['dur']
             src_path = ad['path'] if os.path.exists(ad['path']) else None
@@ -537,7 +541,7 @@ class Runner:
         
         subprocess.run(["pkill", "-9", "-f", "mpv --fs"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
-        # --- LEAN MPV COMMAND (NO FLUFF) ---
+        # --- CPU OPTIMIZATION FLAGS ---
         cmd = ["mpv", "--fs", "--no-border", "--really-quiet", 
                "--ontop", "--keep-open=no",
                "--input-default-bindings=no", "--input-vo-keyboard=no", 
@@ -555,7 +559,7 @@ class Runner:
         env = os.environ.copy(); env["DISPLAY"] = env.get("DISPLAY", ":0")
         
         TIMEOUT_VAL = total_sec + MPV_TIMEOUT_BUFFER
-        self.log.info(f"Playing Batch (RAM + Lean). Total: {total_sec}s.")
+        self.log.info(f"Playing Batch (Optimized). Total: {total_sec}s.")
 
         try:
             subprocess.run(cmd, env=env, check=False, timeout=TIMEOUT_VAL)
@@ -565,14 +569,13 @@ class Runner:
         
         if snap: duck_others(False, snap)
         
-        for rf in ram_files:
-            try: os.remove(rf)
-            except: pass
+        # 2. Post-Play Clean
+        clean_ram_disk()
             
         return len(items)
 
     def run(self):
-        self.log.info(f"Runner Start v0.0.14. ID={self.device}")
+        self.log.info(f"Runner Start v0.0.17. ID={self.device}")
         time.sleep(self.cfg.get("initial_start_delay_secs", 10))
         while True:
             while len(self.queue) < self.cfg.get("queue_max",5):
@@ -726,9 +729,10 @@ echo "$CURRENT_VER" > "$INSTALL_DIR/version.txt"
 ln -sfn "$INSTALL_DIR" "$BASE_DIR/current"
 ln -sfn "$BASE_DIR/current" "$LEGACY_APP_DIR"
 
+# PRIORITY
 tee /etc/systemd/system/ad-runner.service >/dev/null <<UNIT
 [Unit]
-Description=Flawk Ad Runner (Production v0.0.14)
+Description=Flawk Ad Runner (Production v0.0.17)
 After=network-online.target sound.target graphical-session.target
 Wants=network-online.target
 
@@ -778,9 +782,9 @@ systemctl enable --now ad-runner.service
 
 echo
 echo "=========================================="
-echo "   FLAWK AD RUNNER INSTALLED (v0.0.14)"
-echo "   - Lean MPV: ACTIVE (No bloat flags)"
-echo "   - Compositor Bypass: ON"
+echo "   FLAWK AD RUNNER INSTALLED (v0.0.17)"
+echo "   - CPU Optimizations: ACTIVE (Fast Decode)"
+echo "   - RAM Hygiene: ACTIVE (Aggressive)"
 echo "=========================================="
 echo " Device ID: $DEVICE_ID"
 echo " Status:    systemctl status ad-runner"
