@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# FLAWK AD RUNNER - MASTER PRODUCTION INSTALLER (v0.0.22)
+# FLAWK AD RUNNER - MASTER PRODUCTION INSTALLER (v0.0.23)
 #
 # RELEASE NOTES:
-# - COLOR FIX: Switched output from '--vo=x11' to '--vo=sdl'.
-#   (Fixes "Psychedelic/Inverted Colors" by using SDL's reliable color conversion).
-# - QUALITY TWEAK: Changed scaler to 'bilinear' (removes 'fast-' artifacts).
-# - RETAINED: CPU Optimizations (Threads=2, SkipLoopFilter, FrameDrop).
-# - INCLUDES: RAM Playback, Priority Boost (Nice -15), RAM Cleaning.
+# - QUARANTINE MODE: Before playback, 'chromium' is pinned to CPU Core 0.
+#   This frees up Cores 1-3 strictly for the Ad Runner.
+#   (Restores full access to Chromium after playback ends).
+# - HW ACCEL RETRY: Re-enabled '--vo=gpu' and '--hwdec=mmal' on the assumption
+#   that GPU_MEM is now 256MB+ and CPU contention is solved by quarantine.
+# - INCLUDES: RAM Playback, RAM Cleaning.
 # ==============================================================================
 
 # Strict Mode
@@ -24,7 +25,7 @@ touch "$INSTALL_LOG" >/dev/null 2>&1 || true
 chmod 0666 "$INSTALL_LOG" >/dev/null 2>&1 || true
 exec > >(tee -a "$INSTALL_LOG") 2>&1
 
-echo "=== [$(date)] Starting v0.0.22 (Safe Color Mode) Installation ==="
+echo "=== [$(date)] Starting v0.0.23 (Quarantine + HW Accel) Installation ==="
 
 if [ ! -t 0 ] && [ -r /dev/tty ]; then exec </dev/tty; fi
 
@@ -34,7 +35,7 @@ if [ ! -t 0 ] && [ -r /dev/tty ]; then exec </dev/tty; fi
 BASE_DIR="/opt/flawk"
 DATA_DIR="$BASE_DIR/data"
 VERSIONS_DIR="$BASE_DIR/versions"
-CURRENT_VER="v0.0.22"
+CURRENT_VER="v0.0.23"
 INSTALL_DIR="$VERSIONS_DIR/$CURRENT_VER"
 LEGACY_APP_DIR="/opt/ad-runner"
 
@@ -104,10 +105,10 @@ rm -rf "$VERSIONS_DIR"
 rm -f "$BASE_DIR/current"
 
 # ==============================================================================
-# [6] DEPENDENCIES (Safe Mode)
+# [6] DEPENDENCIES
 # ==============================================================================
 echo "== Phase 2: Dependencies (Safe Mode) =="
-apt-get install -y mpv python3 python3-venv python3-pip curl ca-certificates jq pulseaudio-utils logrotate coreutils || true
+apt-get install -y mpv python3 python3-venv python3-pip curl ca-certificates jq pulseaudio-utils logrotate coreutils util-linux || true
 
 # ==============================================================================
 # [7] ARCHITECTURE SETUP
@@ -176,7 +177,7 @@ sudo -u "$RUN_USER" "$INSTALL_DIR/.venv/bin/pip" install --upgrade pip requests 
 # ==============================================================================
 # [10] APPLICATION CODE
 # ==============================================================================
-echo "== Phase 6: Installing App Logic (v0.0.22) =="
+echo "== Phase 6: Installing App Logic (v0.0.23) =="
 
 sudo -u "$RUN_USER" tee "$INSTALL_DIR/ad_runner.py" >/dev/null <<'PY'
 #!/usr/bin/env python3
@@ -190,7 +191,7 @@ from urllib3.util import connection, Retry
 from xml.etree import ElementTree as ET
 
 LOCK_PATH = "/opt/ad-runner/ad_runner.lock"
-HEADERS = {"User-Agent":"FlawkAdRunner/0.0.22 (Linux; Production)","Accept":"application/xml,text/xml,*/*"}
+HEADERS = {"User-Agent":"FlawkAdRunner/0.0.23 (Linux; Production)","Accept":"application/xml,text/xml,*/*"}
 MPV_TIMEOUT_BUFFER = 60
 RAM_DISK_PATH = "/dev/shm" 
 
@@ -226,6 +227,38 @@ def clean_ram_disk():
             try: f.unlink()
             except: pass
     except: pass
+
+# --- QUARANTINE LOGIC ---
+def get_bg_pids():
+    # Find all chromium processes
+    try:
+        out = subprocess.check_output(["pgrep", "-f", "chromium"], text=True)
+        return [p.strip() for p in out.splitlines() if p.strip()]
+    except: return []
+
+def set_affinity(pids, cores_str):
+    # cores_str: "0" or "0-3"
+    if not pids: return
+    try:
+        # taskset -pca <cores> <pid>
+        for pid in pids:
+            subprocess.run(["taskset", "-pca", cores_str, pid], 
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except: pass
+
+def quarantine_background():
+    pids = get_bg_pids()
+    if pids:
+        # Pin background apps strictly to Core 0
+        set_affinity(pids, "0")
+        return pids
+    return []
+
+def restore_background(pids):
+    if pids:
+        # Restore to all cores (0-3)
+        set_affinity(pids, "0-3")
+# ------------------------
 
 def parse_duration(t:str)->int:
     if not t: return 0
@@ -323,7 +356,7 @@ def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
             def score_fn(c):
                 h = c["h"]
                 if h <= 0: return 999999
-                return min(abs(h - 720), abs(h - 480))
+                return min(abs(h - 1080), abs(h - 720))
             candidates.sort(key=score_fn)
             result["media_url"] = candidates[0]["url"]
 
@@ -538,21 +571,21 @@ class Runner:
         
         subprocess.run(["pkill", "-9", "-f", "mpv --fs"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
-        # --- COLOR FIX MODE: SDL OUTPUT ---
-        cmd = ["mpv", "--fs", "--no-border", "--really-quiet", 
+        # --- 1. ENTER QUARANTINE ---
+        # Pin background apps (chromium) to Core 0 ONLY
+        quarantined_pids = quarantine_background()
+        self.log.info(f"Quarantined {len(quarantined_pids)} processes to Core 0.")
+        
+        # --- 2. RUN MPV ON GPU (Assuming sufficient gpu_mem) ---
+        cmd = ["taskset", "-c", "1-3", # Pin MPV to Cores 1, 2, 3
+               "mpv", "--fs", "--no-border", "--really-quiet", 
                "--ontop", "--keep-open=no",
                "--input-default-bindings=no", "--input-vo-keyboard=no", 
                "--cursor-autohide=always", "--osc=no", 
-               "--x11-bypass-compositor=yes",
                
-               # --- OPTIMIZATIONS + COLOR FIX ---
-               "--vo=sdl",                   # 1. FIXES COLORS
-               "--sws-scaler=bilinear",      # 2. Removes 'Fast' artifacts
-               "--vd-lavc-skiploopfilter=all",
-               "--vd-lavc-fast", 
-               "--framedrop=decoder", 
-               "--vd-lavc-threads=2", 
-               # ---------------------------------
+               # --- TRY GPU AGAIN ---
+               "--vo=gpu", "--hwdec=mmal", # The Dream Configuration
+               # ---------------------
                
                f"--log-file=/var/log/ad-runner/mpv_player.log"]
         
@@ -562,7 +595,7 @@ class Runner:
         env = os.environ.copy(); env["DISPLAY"] = env.get("DISPLAY", ":0")
         
         TIMEOUT_VAL = total_sec + MPV_TIMEOUT_BUFFER
-        self.log.info(f"Playing Batch (SDL Mode). Total: {total_sec}s.")
+        self.log.info(f"Playing Batch (GPU + Quarantine). Total: {total_sec}s.")
 
         try:
             subprocess.run(cmd, env=env, check=False, timeout=TIMEOUT_VAL)
@@ -572,12 +605,16 @@ class Runner:
         
         if snap: duck_others(False, snap)
         
+        # --- 3. RELEASE QUARANTINE ---
+        restore_background(quarantined_pids)
+        self.log.info("Released quarantine.")
+        
         clean_ram_disk()
             
         return len(items)
 
     def run(self):
-        self.log.info(f"Runner Start v0.0.22. ID={self.device}")
+        self.log.info(f"Runner Start v0.0.23. ID={self.device}")
         time.sleep(self.cfg.get("initial_start_delay_secs", 10))
         while True:
             while len(self.queue) < self.cfg.get("queue_max",5):
@@ -734,7 +771,7 @@ ln -sfn "$BASE_DIR/current" "$LEGACY_APP_DIR"
 # PRIORITY
 tee /etc/systemd/system/ad-runner.service >/dev/null <<UNIT
 [Unit]
-Description=Flawk Ad Runner (Production v0.0.22)
+Description=Flawk Ad Runner (Production v0.0.23)
 After=network-online.target sound.target graphical-session.target
 Wants=network-online.target
 
@@ -784,9 +821,9 @@ systemctl enable --now ad-runner.service
 
 echo
 echo "=========================================="
-echo "   FLAWK AD RUNNER INSTALLED (v0.0.22)"
-echo "   - Mode: Safe Color (SDL Output)"
-echo "   - Critical: Disconnect AnyDesk for Smoothness"
+echo "   FLAWK AD RUNNER INSTALLED (v0.0.23)"
+echo "   - Quarantine Mode: Active (Pins Chromium to Core 0)"
+echo "   - HW Accel: Active (GPU)"
 echo "=========================================="
 echo " Device ID: $DEVICE_ID"
 echo " Status:    systemctl status ad-runner"
