@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# FLAWK AD RUNNER - MASTER PRODUCTION INSTALLER (v0.0.23)
+# FLAWK AD RUNNER - MASTER PRODUCTION INSTALLER (v0.0.24)
 #
 # RELEASE NOTES:
-# - QUARANTINE MODE: Before playback, 'chromium' is pinned to CPU Core 0.
-#   This frees up Cores 1-3 strictly for the Ad Runner.
-#   (Restores full access to Chromium after playback ends).
-# - HW ACCEL RETRY: Re-enabled '--vo=gpu' and '--hwdec=mmal' on the assumption
-#   that GPU_MEM is now 256MB+ and CPU contention is solved by quarantine.
-# - INCLUDES: RAM Playback, RAM Cleaning.
+# - SYSTEM CONFIG: Auto-GPU Memory.
+#   Checks if GPU RAM < 256MB. If so, updates /boot/config.txt and REBOOTS.
+#   (User must run script again after reboot).
+# - QUARANTINE MODE: Active (Pins Chromium to Core 0).
+# - HW ACCEL: Active (GPU/MMAL).
 # ==============================================================================
 
 # Strict Mode
@@ -25,7 +24,7 @@ touch "$INSTALL_LOG" >/dev/null 2>&1 || true
 chmod 0666 "$INSTALL_LOG" >/dev/null 2>&1 || true
 exec > >(tee -a "$INSTALL_LOG") 2>&1
 
-echo "=== [$(date)] Starting v0.0.23 (Quarantine + HW Accel) Installation ==="
+echo "=== [$(date)] Starting v0.0.24 (Auto-Config + Quarantine) Installation ==="
 
 if [ ! -t 0 ] && [ -r /dev/tty ]; then exec </dev/tty; fi
 
@@ -35,7 +34,7 @@ if [ ! -t 0 ] && [ -r /dev/tty ]; then exec </dev/tty; fi
 BASE_DIR="/opt/flawk"
 DATA_DIR="$BASE_DIR/data"
 VERSIONS_DIR="$BASE_DIR/versions"
-CURRENT_VER="v0.0.23"
+CURRENT_VER="v0.0.24"
 INSTALL_DIR="$VERSIONS_DIR/$CURRENT_VER"
 LEGACY_APP_DIR="/opt/ad-runner"
 
@@ -68,6 +67,46 @@ ensure_user_bus() {
   fi
 }
 
+check_and_fix_gpu_mem() {
+    # Check current memory split
+    if ! command -v vcgencmd >/dev/null; then
+        echo "WARNING: vcgencmd not found. Skipping GPU memory check."
+        return
+    fi
+
+    CURRENT_MEM=$(vcgencmd get_mem gpu | cut -d= -f2 | tr -d 'M')
+    REQUIRED_MEM=256
+
+    if [ "$CURRENT_MEM" -lt "$REQUIRED_MEM" ]; then
+        echo "========================================================"
+        echo " CONFIGURATION REQUIRED: GPU MEMORY LOW ($CURRENT_MEM MB)"
+        echo " Increasing to $REQUIRED_MEM MB to support HW Acceleration..."
+        echo "========================================================"
+        
+        # Backup config
+        cp /boot/config.txt /boot/config.txt.bak_v024
+        
+        # Update or Append
+        if grep -q "gpu_mem=" /boot/config.txt; then
+            # Replace existing line using sed
+            sed -i "s/^gpu_mem=.*/gpu_mem=$REQUIRED_MEM/" /boot/config.txt
+        else
+            # Append to end
+            echo "gpu_mem=$REQUIRED_MEM" >> /boot/config.txt
+        fi
+        
+        echo "SUCCESS: Config updated."
+        echo "!!! REBOOT REQUIRED !!!"
+        echo "The system handles video memory at boot time."
+        echo "Rebooting in 5 seconds... (Please run this script again after reboot)"
+        sleep 5
+        reboot
+        exit 0
+    else
+        echo "== GPU Memory: $CURRENT_MEM MB (OK) =="
+    fi
+}
+
 # ==============================================================================
 # [4] PRE-FLIGHT
 # ==============================================================================
@@ -75,6 +114,9 @@ RUN_USER="$(detect_run_user)"
 RUN_GROUP="$(id -gn "$RUN_USER")"
 RUN_UID=$(id -u "$RUN_USER")
 echo "== Target User: $RUN_USER (UID: $RUN_UID) =="
+
+# *** AUTO-CONFIG STEP ***
+check_and_fix_gpu_mem
 
 # ==============================================================================
 # [5] THE "NUKE" PHASE
@@ -177,7 +219,7 @@ sudo -u "$RUN_USER" "$INSTALL_DIR/.venv/bin/pip" install --upgrade pip requests 
 # ==============================================================================
 # [10] APPLICATION CODE
 # ==============================================================================
-echo "== Phase 6: Installing App Logic (v0.0.23) =="
+echo "== Phase 6: Installing App Logic (v0.0.24) =="
 
 sudo -u "$RUN_USER" tee "$INSTALL_DIR/ad_runner.py" >/dev/null <<'PY'
 #!/usr/bin/env python3
@@ -191,7 +233,7 @@ from urllib3.util import connection, Retry
 from xml.etree import ElementTree as ET
 
 LOCK_PATH = "/opt/ad-runner/ad_runner.lock"
-HEADERS = {"User-Agent":"FlawkAdRunner/0.0.23 (Linux; Production)","Accept":"application/xml,text/xml,*/*"}
+HEADERS = {"User-Agent":"FlawkAdRunner/0.0.24 (Linux; Production)","Accept":"application/xml,text/xml,*/*"}
 MPV_TIMEOUT_BUFFER = 60
 RAM_DISK_PATH = "/dev/shm" 
 
@@ -230,17 +272,14 @@ def clean_ram_disk():
 
 # --- QUARANTINE LOGIC ---
 def get_bg_pids():
-    # Find all chromium processes
     try:
         out = subprocess.check_output(["pgrep", "-f", "chromium"], text=True)
         return [p.strip() for p in out.splitlines() if p.strip()]
     except: return []
 
 def set_affinity(pids, cores_str):
-    # cores_str: "0" or "0-3"
     if not pids: return
     try:
-        # taskset -pca <cores> <pid>
         for pid in pids:
             subprocess.run(["taskset", "-pca", cores_str, pid], 
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -249,14 +288,14 @@ def set_affinity(pids, cores_str):
 def quarantine_background():
     pids = get_bg_pids()
     if pids:
-        # Pin background apps strictly to Core 0
+        # Chromium to Core 0 Only
         set_affinity(pids, "0")
         return pids
     return []
 
 def restore_background(pids):
     if pids:
-        # Restore to all cores (0-3)
+        # Restore to all cores
         set_affinity(pids, "0-3")
 # ------------------------
 
@@ -572,7 +611,6 @@ class Runner:
         subprocess.run(["pkill", "-9", "-f", "mpv --fs"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
         # --- 1. ENTER QUARANTINE ---
-        # Pin background apps (chromium) to Core 0 ONLY
         quarantined_pids = quarantine_background()
         self.log.info(f"Quarantined {len(quarantined_pids)} processes to Core 0.")
         
@@ -584,7 +622,7 @@ class Runner:
                "--cursor-autohide=always", "--osc=no", 
                
                # --- TRY GPU AGAIN ---
-               "--vo=gpu", "--hwdec=mmal", # The Dream Configuration
+               "--vo=gpu", "--hwdec=mmal",
                # ---------------------
                
                f"--log-file=/var/log/ad-runner/mpv_player.log"]
@@ -595,7 +633,7 @@ class Runner:
         env = os.environ.copy(); env["DISPLAY"] = env.get("DISPLAY", ":0")
         
         TIMEOUT_VAL = total_sec + MPV_TIMEOUT_BUFFER
-        self.log.info(f"Playing Batch (GPU + Quarantine). Total: {total_sec}s.")
+        self.log.info(f"Playing Batch (GPU+Quarantine). Total: {total_sec}s.")
 
         try:
             subprocess.run(cmd, env=env, check=False, timeout=TIMEOUT_VAL)
@@ -614,7 +652,7 @@ class Runner:
         return len(items)
 
     def run(self):
-        self.log.info(f"Runner Start v0.0.23. ID={self.device}")
+        self.log.info(f"Runner Start v0.0.24. ID={self.device}")
         time.sleep(self.cfg.get("initial_start_delay_secs", 10))
         while True:
             while len(self.queue) < self.cfg.get("queue_max",5):
@@ -771,7 +809,7 @@ ln -sfn "$BASE_DIR/current" "$LEGACY_APP_DIR"
 # PRIORITY
 tee /etc/systemd/system/ad-runner.service >/dev/null <<UNIT
 [Unit]
-Description=Flawk Ad Runner (Production v0.0.23)
+Description=Flawk Ad Runner (Production v0.0.24)
 After=network-online.target sound.target graphical-session.target
 Wants=network-online.target
 
@@ -821,8 +859,9 @@ systemctl enable --now ad-runner.service
 
 echo
 echo "=========================================="
-echo "   FLAWK AD RUNNER INSTALLED (v0.0.23)"
-echo "   - Quarantine Mode: Active (Pins Chromium to Core 0)"
+echo "   FLAWK AD RUNNER INSTALLED (v0.0.24)"
+echo "   - Auto-Config: GPU Memory Check (256MB)"
+echo "   - Quarantine Mode: Active"
 echo "   - HW Accel: Active (GPU)"
 echo "=========================================="
 echo " Device ID: $DEVICE_ID"
