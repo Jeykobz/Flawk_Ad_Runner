@@ -535,7 +535,8 @@ class Runner:
         cmd = ["mpv", "--fs", "--no-border", "--really-quiet", 
                "--ontop", "--force-window=immediate", "--keep-open=no",
                "--geometry=100%x100%", "--autofit=100%",
-               "--input-default-bindings=no", "--input-vo-keyboard=no", 
+               "--input-default-bindings=no", "--input-vo-keyboard=no",
+               "--x11-bypass-compositor=yes",
                "--cursor-autohide=always", "--osc=no", #"--prefetch-playlist=yes",
                "--vo=gpu", "--gpu-context=x11" if os.environ.get("DISPLAY") else "--gpu-context=drm",
                f"--log-file=/var/log/ad-runner/mpv_player.log"]
@@ -733,6 +734,7 @@ Restart=always
 RestartSec=5
 StartLimitBurst=10
 StartLimitIntervalSec=60
+Nice=-15
 CPUWeight=1000
 Environment=DISPLAY=:0
 Environment=XDG_RUNTIME_DIR=/run/user/$RUN_UID
