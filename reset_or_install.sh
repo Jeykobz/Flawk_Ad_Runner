@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# FLAWK AD RUNNER - MASTER PRODUCTION INSTALLER (v0.0.24)
+# FLAWK AD RUNNER - MASTER PRODUCTION INSTALLER (v0.0.8)
 #
 # RELEASE NOTES:
-# - SYSTEM CONFIG: Auto-GPU Memory.
-#   Checks if GPU RAM < 256MB. If so, updates /boot/config.txt and REBOOTS.
-#   (User must run script again after reboot).
-# - QUARANTINE MODE: Active (Pins Chromium to Core 0).
-# - HW ACCEL: Active (GPU/MMAL).
+# - CONFIG UPDATE: Cooldown=30s, Queue=5, Poll=10s.
+# - SYSTEM: 'apt-get update' removed. 'apt-get install' is error-tolerant.
+# - INCLUDES: Smart Resolution Picker, Mute Fix, VAST Recursion, Updater.
 # ==============================================================================
 
 # Strict Mode
@@ -24,7 +22,7 @@ touch "$INSTALL_LOG" >/dev/null 2>&1 || true
 chmod 0666 "$INSTALL_LOG" >/dev/null 2>&1 || true
 exec > >(tee -a "$INSTALL_LOG") 2>&1
 
-echo "=== [$(date)] Starting v0.0.24 (Auto-Config + Quarantine) Installation ==="
+echo "=== [$(date)] Starting v0.0.8 Installation ==="
 
 if [ ! -t 0 ] && [ -r /dev/tty ]; then exec </dev/tty; fi
 
@@ -34,7 +32,7 @@ if [ ! -t 0 ] && [ -r /dev/tty ]; then exec </dev/tty; fi
 BASE_DIR="/opt/flawk"
 DATA_DIR="$BASE_DIR/data"
 VERSIONS_DIR="$BASE_DIR/versions"
-CURRENT_VER="v0.0.24"
+CURRENT_VER="v0.0.8"
 INSTALL_DIR="$VERSIONS_DIR/$CURRENT_VER"
 LEGACY_APP_DIR="/opt/ad-runner"
 
@@ -67,46 +65,6 @@ ensure_user_bus() {
   fi
 }
 
-check_and_fix_gpu_mem() {
-    # Check current memory split
-    if ! command -v vcgencmd >/dev/null; then
-        echo "WARNING: vcgencmd not found. Skipping GPU memory check."
-        return
-    fi
-
-    CURRENT_MEM=$(vcgencmd get_mem gpu | cut -d= -f2 | tr -d 'M')
-    REQUIRED_MEM=256
-
-    if [ "$CURRENT_MEM" -lt "$REQUIRED_MEM" ]; then
-        echo "========================================================"
-        echo " CONFIGURATION REQUIRED: GPU MEMORY LOW ($CURRENT_MEM MB)"
-        echo " Increasing to $REQUIRED_MEM MB to support HW Acceleration..."
-        echo "========================================================"
-        
-        # Backup config
-        cp /boot/config.txt /boot/config.txt.bak_v024
-        
-        # Update or Append
-        if grep -q "gpu_mem=" /boot/config.txt; then
-            # Replace existing line using sed
-            sed -i "s/^gpu_mem=.*/gpu_mem=$REQUIRED_MEM/" /boot/config.txt
-        else
-            # Append to end
-            echo "gpu_mem=$REQUIRED_MEM" >> /boot/config.txt
-        fi
-        
-        echo "SUCCESS: Config updated."
-        echo "!!! REBOOT REQUIRED !!!"
-        echo "The system handles video memory at boot time."
-        echo "Rebooting in 5 seconds... (Please run this script again after reboot)"
-        sleep 5
-        reboot
-        exit 0
-    else
-        echo "== GPU Memory: $CURRENT_MEM MB (OK) =="
-    fi
-}
-
 # ==============================================================================
 # [4] PRE-FLIGHT
 # ==============================================================================
@@ -114,9 +72,6 @@ RUN_USER="$(detect_run_user)"
 RUN_GROUP="$(id -gn "$RUN_USER")"
 RUN_UID=$(id -u "$RUN_USER")
 echo "== Target User: $RUN_USER (UID: $RUN_UID) =="
-
-# *** AUTO-CONFIG STEP ***
-check_and_fix_gpu_mem
 
 # ==============================================================================
 # [5] THE "NUKE" PHASE
@@ -150,7 +105,9 @@ rm -f "$BASE_DIR/current"
 # [6] DEPENDENCIES
 # ==============================================================================
 echo "== Phase 2: Dependencies (Safe Mode) =="
-apt-get install -y mpv python3 python3-venv python3-pip curl ca-certificates jq pulseaudio-utils logrotate coreutils util-linux || true
+# NO apt-get update
+# Try install, but don't fail if repo is unreachable (|| true)
+apt-get install -y mpv python3 python3-venv python3-pip curl ca-certificates jq pulseaudio-utils logrotate coreutils || true
 
 # ==============================================================================
 # [7] ARCHITECTURE SETUP
@@ -174,6 +131,13 @@ CONF_FILE="$DATA_DIR/config.json"
 if [ -f "$CONF_FILE" ]; then
     echo "== Phase 4: Existing Config Found =="
     DEVICE_ID=$(jq -r .device_id "$CONF_FILE" 2>/dev/null || echo "Unknown")
+    
+    # PATCH CONFIG WITH NEW DEFAULTS (v0.0.8)
+    tmp=$(mktemp)
+    jq '.per_ad_cooldown_secs = 30 | .queue_max = 5 | .poll_interval_secs = 10' "$CONF_FILE" > "$tmp" && mv "$tmp" "$CONF_FILE"
+    chown "$RUN_USER:$RUN_GROUP" "$CONF_FILE"
+    echo "   Config patched with v0.0.8 defaults."
+    
 else
     echo "== Phase 4: New Configuration Required =="
     if [ -t 0 ]; then read -rp "Device ID (required): " DEVICE_ID; else read -rp "Device ID (required): " DEVICE_ID < /dev/tty; fi
@@ -219,11 +183,11 @@ sudo -u "$RUN_USER" "$INSTALL_DIR/.venv/bin/pip" install --upgrade pip requests 
 # ==============================================================================
 # [10] APPLICATION CODE
 # ==============================================================================
-echo "== Phase 6: Installing App Logic (v0.0.24) =="
+echo "== Phase 6: Installing App Logic (v0.0.8) =="
 
 sudo -u "$RUN_USER" tee "$INSTALL_DIR/ad_runner.py" >/dev/null <<'PY'
 #!/usr/bin/env python3
-import os, sys, time, json, random, hashlib, threading, subprocess, logging, logging.handlers, fcntl, re, socket, shutil
+import os, sys, time, json, random, hashlib, threading, subprocess, logging, logging.handlers, fcntl, re, socket
 import concurrent.futures
 import urllib.parse as up
 from pathlib import Path
@@ -233,9 +197,8 @@ from urllib3.util import connection, Retry
 from xml.etree import ElementTree as ET
 
 LOCK_PATH = "/opt/ad-runner/ad_runner.lock"
-HEADERS = {"User-Agent":"FlawkAdRunner/0.0.24 (Linux; Production)","Accept":"application/xml,text/xml,*/*"}
-MPV_TIMEOUT_BUFFER = 60
-RAM_DISK_PATH = "/dev/shm" 
+HEADERS = {"User-Agent":"FlawkAdRunner/0.0.8 (Linux; Production)","Accept":"application/xml,text/xml,*/*"}
+MPV_TIMEOUT_BUFFER = 40 
 
 class IPv4HTTPAdapter(HTTPAdapter):
     def init_poolmanager(self, *args, **kwargs):
@@ -256,48 +219,13 @@ def acquire_singleton_lock(lock_path):
     Path(os.path.dirname(lock_path)).mkdir(parents=True, exist_ok=True)
     fp = open(lock_path, "a+")
     try: fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError: sys.exit(1)
+    except BlockingIOError: 
+        print("Ad Runner is already running (Locked). Exiting with code 1.")
+        sys.exit(1)
     return fp
 
 def ensure_dir(p): Path(p).mkdir(parents=True, exist_ok=True)
 def sha256_hex(s): return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-def clean_ram_disk():
-    try:
-        p = Path(RAM_DISK_PATH)
-        for f in p.glob("flawk_*"):
-            try: f.unlink()
-            except: pass
-    except: pass
-
-# --- QUARANTINE LOGIC ---
-def get_bg_pids():
-    try:
-        out = subprocess.check_output(["pgrep", "-f", "chromium"], text=True)
-        return [p.strip() for p in out.splitlines() if p.strip()]
-    except: return []
-
-def set_affinity(pids, cores_str):
-    if not pids: return
-    try:
-        for pid in pids:
-            subprocess.run(["taskset", "-pca", cores_str, pid], 
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except: pass
-
-def quarantine_background():
-    pids = get_bg_pids()
-    if pids:
-        # Chromium to Core 0 Only
-        set_affinity(pids, "0")
-        return pids
-    return []
-
-def restore_background(pids):
-    if pids:
-        # Restore to all cores
-        set_affinity(pids, "0-3")
-# ------------------------
 
 def parse_duration(t:str)->int:
     if not t: return 0
@@ -315,7 +243,13 @@ def parse_duration(t:str)->int:
         else:
             hh, mm, ss = s.split(':')
             return int(hh)*3600 + int(mm)*60 + int(ss)
-    except Exception: return 15
+    except Exception:
+        try:
+            parts = s.replace(':', ' ').split()
+            if len(parts) >= 3:
+                return int(parts[0])*3600 + int(parts[1])*60 + int(parts[2])
+        except: pass
+        return 15
 
 def replace_macros(url, duration, playhead):
     ts=int(time.time()); cb=str(random.randint(10000000,99999999))
@@ -327,6 +261,7 @@ def _strip_ns(tag):
     if '}' in tag: return tag.split('}', 1)[1]
     return tag
 
+# --- SMART PARSER (Media Selection + Recursion) ---
 def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
     if depth > max_depth: return None
     result = {"media_url": None, "duration": 15, "impressions": [], "trackers": {"start":[],"firstQuartile":[],"midpoint":[],"thirdQuartile":[],"complete":[]}}
@@ -379,8 +314,10 @@ def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
         for mf in inline.findall(".//{*}MediaFile"):
             u = mf.text.strip() if mf.text else ""
             if not u: continue
+            
             typ = mf.get("type", "").lower()
             if "mp4" not in typ and not u.endswith(".mp4"): continue
+                
             w_str, h_str = mf.get("width"), mf.get("height")
             try: w = int(w_str) if w_str else 0; h = int(h_str) if h_str else 0
             except: w, h = 0, 0
@@ -395,7 +332,7 @@ def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
             def score_fn(c):
                 h = c["h"]
                 if h <= 0: return 999999
-                return min(abs(h - 1080), abs(h - 720))
+                return min(abs(h - 720), abs(h - 1080))
             candidates.sort(key=score_fn)
             result["media_url"] = candidates[0]["url"]
 
@@ -493,7 +430,6 @@ class Runner:
         
         ensure_dir(self.cache)
         enforce_cache_budget(self.cache, log=self.log)
-        clean_ram_disk()
         
         self.queue = []
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=6)
@@ -570,30 +506,16 @@ class Runner:
             return False
 
     def play_queue(self):
-        clean_ram_disk()
-        
         if not self.queue: return 0
         items = list(self.queue); self.queue.clear()
         paths = []
-        ram_files = [] 
-        
         total_sec = 0
-        
         for ad in items:
             total_sec += ad['dur']
-            src_path = ad['path'] if os.path.exists(ad['path']) else None
-            if src_path:
-                Path(src_path).touch()
-                base = os.path.basename(src_path)
-                ram_path = os.path.join(RAM_DISK_PATH, f"flawk_{base}")
-                try:
-                    shutil.copyfile(src_path, ram_path)
-                    paths.append(ram_path)
-                    ram_files.append(ram_path)
-                except:
-                    paths.append(src_path)
-            else:
-                paths.append(ad['src'])
+            if os.path.exists(ad['path']):
+                Path(ad['path']).touch()
+                paths.append(ad['path'])
+            else: paths.append(ad['src'])
         
         offset = 0
         for ad in items:
@@ -610,22 +532,18 @@ class Runner:
         
         subprocess.run(["pkill", "-9", "-f", "mpv --fs"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
-        # --- 1. ENTER QUARANTINE ---
-        quarantined_pids = quarantine_background()
-        self.log.info(f"Quarantined {len(quarantined_pids)} processes to Core 0.")
-        
-        # --- 2. RUN MPV ON GPU (Assuming sufficient gpu_mem) ---
-        cmd = ["taskset", "-c", "1-3", # Pin MPV to Cores 1, 2, 3
-               "mpv", "--fs", "--no-border", "--really-quiet", 
-               "--ontop", "--keep-open=no",
+        cmd = ["mpv", "--fs", "--no-border", "--really-quiet", 
+               "--ontop", "--force-window=immediate", "--keep-open=no",
+               "--geometry=100%x100%", "--autofit=100%",
                "--input-default-bindings=no", "--input-vo-keyboard=no", 
-               "--cursor-autohide=always", "--osc=no", 
-               
-               # --- TRY GPU AGAIN ---
-               "--vo=gpu", "--hwdec=mmal",
-               # ---------------------
-               
+               "--cursor-autohide=always", "--osc=no", #"--prefetch-playlist=yes",
+               "--vo=gpu", "--gpu-context=x11" if os.environ.get("DISPLAY") else "--gpu-context=drm",
                f"--log-file=/var/log/ad-runner/mpv_player.log"]
+
+        if os.environ.get("DISPLAY"):
+             cmd.extend(["--vo=gpu", "--gpu-context=x11"])
+        else:
+             cmd.extend(["--vo=gpu", "--gpu-context=drm"])
         
         if is_muted: cmd.append("--mute=yes")
         cmd = cmd + paths
@@ -633,7 +551,7 @@ class Runner:
         env = os.environ.copy(); env["DISPLAY"] = env.get("DISPLAY", ":0")
         
         TIMEOUT_VAL = total_sec + MPV_TIMEOUT_BUFFER
-        self.log.info(f"Playing Batch (GPU+Quarantine). Total: {total_sec}s.")
+        self.log.info(f"Playing Batch. Total: {total_sec}s. Watchdog: {TIMEOUT_VAL}s")
 
         try:
             subprocess.run(cmd, env=env, check=False, timeout=TIMEOUT_VAL)
@@ -642,17 +560,10 @@ class Runner:
             subprocess.run(["pkill", "-9", "-f", "mpv --fs"], stdout=subprocess.DEVNULL)
         
         if snap: duck_others(False, snap)
-        
-        # --- 3. RELEASE QUARANTINE ---
-        restore_background(quarantined_pids)
-        self.log.info("Released quarantine.")
-        
-        clean_ram_disk()
-            
         return len(items)
 
     def run(self):
-        self.log.info(f"Runner Start v0.0.24. ID={self.device}")
+        self.log.info(f"Runner Start v0.0.8. ID={self.device}")
         time.sleep(self.cfg.get("initial_start_delay_secs", 10))
         while True:
             while len(self.queue) < self.cfg.get("queue_max",5):
@@ -806,10 +717,9 @@ echo "$CURRENT_VER" > "$INSTALL_DIR/version.txt"
 ln -sfn "$INSTALL_DIR" "$BASE_DIR/current"
 ln -sfn "$BASE_DIR/current" "$LEGACY_APP_DIR"
 
-# PRIORITY
 tee /etc/systemd/system/ad-runner.service >/dev/null <<UNIT
 [Unit]
-Description=Flawk Ad Runner (Production v0.0.24)
+Description=Flawk Ad Runner (Production v0.0.8)
 After=network-online.target sound.target graphical-session.target
 Wants=network-online.target
 
@@ -823,12 +733,7 @@ Restart=always
 RestartSec=5
 StartLimitBurst=10
 StartLimitIntervalSec=60
-MemoryMax=768M
-CPUWeight=50
-# PRIORITY
-Nice=-15
-IOSchedulingClass=realtime
-IOSchedulingPriority=2
+CPUWeight=1000
 Environment=DISPLAY=:0
 Environment=XDG_RUNTIME_DIR=/run/user/$RUN_UID
 StandardOutput=append:$LOG_DIR/service.log
@@ -859,10 +764,9 @@ systemctl enable --now ad-runner.service
 
 echo
 echo "=========================================="
-echo "   FLAWK AD RUNNER INSTALLED (v0.0.24)"
-echo "   - Auto-Config: GPU Memory Check (256MB)"
-echo "   - Quarantine Mode: Active"
-echo "   - HW Accel: Active (GPU)"
+echo "   FLAWK AD RUNNER INSTALLED (v0.0.8)"
+echo "   - Config Tweaked (Cooldown 30s)"
+echo "   - Safe Mode (No apt-get)"
 echo "=========================================="
 echo " Device ID: $DEVICE_ID"
 echo " Status:    systemctl status ad-runner"
