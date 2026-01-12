@@ -101,7 +101,6 @@ sudo rm -f "$LOG_FILE" "$MPV_LOG_FILE" 2>/dev/null || true
 
 # ---------- Dependencies ----------
 echo "== Install prerequisites =="
-sudo apt-get update -y
 sudo apt-get install -y mpv python3 python3-venv python3-pip curl ca-certificates jq pulseaudio-utils logrotate
 
 # ---------- App structure ----------
