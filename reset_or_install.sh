@@ -1,3 +1,185 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# FLAWK AD RUNNER - MASTER PRODUCTION INSTALLER (v0.0.8)
+#
+# RELEASE NOTES:
+# - CONFIG UPDATE: Cooldown=30s, Queue=5, Poll=10s.
+# - SYSTEM: 'apt-get update' removed. 'apt-get install' is error-tolerant.
+# - INCLUDES: Smart Resolution Picker, Mute Fix, VAST Recursion, Updater.
+# ==============================================================================
+
+# Strict Mode
+set -eu
+
+# ==============================================================================
+# [1] INSTALLER LOGGING
+# ==============================================================================
+LOG_DIR="/var/log/ad-runner"
+if [ ! -d "$LOG_DIR" ]; then mkdir -p "$LOG_DIR"; chmod 777 "$LOG_DIR"; fi
+
+INSTALL_LOG="$LOG_DIR/install.log"
+touch "$INSTALL_LOG" >/dev/null 2>&1 || true
+chmod 0666 "$INSTALL_LOG" >/dev/null 2>&1 || true
+exec > >(tee -a "$INSTALL_LOG") 2>&1
+
+echo "=== [$(date)] Starting v0.0.8 Installation ==="
+
+if [ ! -t 0 ] && [ -r /dev/tty ]; then exec </dev/tty; fi
+
+# ==============================================================================
+# [2] CONSTANTS
+# ==============================================================================
+BASE_DIR="/opt/flawk"
+DATA_DIR="$BASE_DIR/data"
+VERSIONS_DIR="$BASE_DIR/versions"
+CURRENT_VER="v0.0.8"
+INSTALL_DIR="$VERSIONS_DIR/$CURRENT_VER"
+LEGACY_APP_DIR="/opt/ad-runner"
+
+# API Config
+API_URL="https://cms.flawkai.com/api/dooh/golocal_screens/ads"
+HEARTBEAT_URL="https://cms.flawkai.com/api/dooh/heartbeat"
+MANIFEST_URL="https://cms.flawkai.com/api/updates/manifest.json"
+DEFAULT_API_KEY="LIVE-XujYRzCR2OOZRgTj9u0nsBASoNmO7g5b"
+
+# ==============================================================================
+# [3] HELPERS
+# ==============================================================================
+die(){ echo "FATAL ERROR: $*" >&2; exit 1; }
+
+detect_run_user() {
+  if [ "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then echo "$SUDO_USER"; return; fi
+  if u=$(logname 2>/dev/null) && [ -n "$u" ] && [ "$u" != "root" ]; then echo "$u"; return; fi
+  if u=$(who | awk 'NR==1{print $1}'); then [ -n "$u" ] && [ "$u" != "root" ] && echo "$u" && return; fi
+  read -rp "Enter desktop username (e.g., pi): " u
+  [ -z "$u" ] && die "Username required."
+  echo "$u"
+}
+
+ensure_user_bus() {
+  local u="$1"; local uid; uid=$(id -u "$u")
+  loginctl enable-linger "$u" >/dev/null 2>&1 || true
+  if ! systemctl is-active "user@${uid}.service" >/dev/null 2>&1; then
+    systemctl start "user@${uid}.service" || true
+    sleep 1
+  fi
+}
+
+# ==============================================================================
+# [4] PRE-FLIGHT
+# ==============================================================================
+RUN_USER="$(detect_run_user)"
+RUN_GROUP="$(id -gn "$RUN_USER")"
+RUN_UID=$(id -u "$RUN_USER")
+echo "== Target User: $RUN_USER (UID: $RUN_UID) =="
+
+# ==============================================================================
+# [5] THE "NUKE" PHASE
+# ==============================================================================
+echo "== Phase 1: Cleaning System =="
+
+BACKUP_CONF="/tmp/flawk_config.bak"
+if [ -f "$DATA_DIR/config.json" ]; then cp "$DATA_DIR/config.json" "$BACKUP_CONF"
+elif [ -f "$LEGACY_APP_DIR/config.json" ]; then cp "$LEGACY_APP_DIR/config.json" "$BACKUP_CONF"; fi
+
+systemctl stop ad-runner.service 2>/dev/null || true
+systemctl disable ad-runner.service 2>/dev/null || true
+rm -f /etc/systemd/system/ad-runner.service
+
+if sudo -u "$RUN_USER" XDG_RUNTIME_DIR="/run/user/$RUN_UID" systemctl --user is-active ad-runner.service >/dev/null 2>&1; then
+    sudo -u "$RUN_USER" XDG_RUNTIME_DIR="/run/user/$RUN_UID" systemctl --user stop ad-runner.service
+    sudo -u "$RUN_USER" XDG_RUNTIME_DIR="/run/user/$RUN_UID" systemctl --user disable ad-runner.service
+fi
+rm -f "/home/$RUN_USER/.config/systemd/user/ad-runner.service"
+
+systemctl daemon-reload
+
+pkill -9 -f "ad_runner.py" 2>/dev/null || true
+pkill -9 -f "mpv --fs" 2>/dev/null || true
+
+rm -rf "$LEGACY_APP_DIR"
+rm -rf "$VERSIONS_DIR"
+rm -f "$BASE_DIR/current"
+
+# ==============================================================================
+# [6] DEPENDENCIES
+# ==============================================================================
+echo "== Phase 2: Dependencies (Safe Mode) =="
+# NO apt-get update
+# Try install, but don't fail if repo is unreachable (|| true)
+apt-get install -y mpv python3 python3-venv python3-pip curl ca-certificates jq pulseaudio-utils logrotate coreutils || true
+
+# ==============================================================================
+# [7] ARCHITECTURE SETUP
+# ==============================================================================
+echo "== Phase 3: Creating Architecture =="
+mkdir -p "$DATA_DIR/cache" "$DATA_DIR/logs" "$INSTALL_DIR"
+
+if [ -f "$BACKUP_CONF" ]; then
+    mv "$BACKUP_CONF" "$DATA_DIR/config.json"
+    echo "   Config restored."
+fi
+
+chown -R "$RUN_USER:$RUN_GROUP" "$BASE_DIR" "$LOG_DIR"
+chmod -R 755 "$BASE_DIR" "$LOG_DIR"
+
+# ==============================================================================
+# [8] CONFIGURATION
+# ==============================================================================
+CONF_FILE="$DATA_DIR/config.json"
+
+if [ -f "$CONF_FILE" ]; then
+    echo "== Phase 4: Existing Config Found =="
+    DEVICE_ID=$(jq -r .device_id "$CONF_FILE" 2>/dev/null || echo "Unknown")
+    
+    # PATCH CONFIG WITH NEW DEFAULTS (v0.0.8)
+    tmp=$(mktemp)
+    jq '.per_ad_cooldown_secs = 30 | .queue_max = 5 | .poll_interval_secs = 10' "$CONF_FILE" > "$tmp" && mv "$tmp" "$CONF_FILE"
+    chown "$RUN_USER:$RUN_GROUP" "$CONF_FILE"
+    echo "   Config patched with v0.0.8 defaults."
+    
+else
+    echo "== Phase 4: New Configuration Required =="
+    if [ -t 0 ]; then read -rp "Device ID (required): " DEVICE_ID; else read -rp "Device ID (required): " DEVICE_ID < /dev/tty; fi
+    [ -z "$DEVICE_ID" ] && die "Device ID is required."
+
+    PLAY_SOUND=true
+    while :; do
+      if [ -t 0 ]; then read -rp "Play ads with sound? [Y/n]: " SOUND_ANS; else read -rp "Play ads with sound? [Y/n]: " SOUND_ANS < /dev/tty; fi
+      SOUND_ANS="${SOUND_ANS:-Y}"
+      case "$SOUND_ANS" in y|Y) PLAY_SOUND=true; break ;; n|N) PLAY_SOUND=false; break ;; *) echo "Please answer Y or N." ;; esac
+    done
+
+    sudo -u "$RUN_USER" tee "$CONF_FILE" >/dev/null <<JSON
+{
+  "device_id": "$DEVICE_ID",
+  "api_url": "$API_URL",
+  "api_key": "$DEFAULT_API_KEY",
+  "heartbeat_url": "$HEARTBEAT_URL",
+  "manifest_url": "$MANIFEST_URL",
+  "width": 1920,
+  "height": 1080,
+  "poll_interval_secs": 10,
+  "fill_window_secs": 30,
+  "queue_max": 5,
+  "per_ad_cooldown_secs": 30,
+  "initial_start_delay_secs": 30,
+  "cache_dir": "$DATA_DIR/cache",
+  "log_file": "$DATA_DIR/logs/ad_runner.log",
+  "play_sound": $PLAY_SOUND,
+  "duck_other_audio": true,
+  "force_ipv4": true
+}
+JSON
+fi
+
+# ==============================================================================
+# [9] PYTHON ENVIRONMENT
+# ==============================================================================
+echo "== Phase 5: Python Setup =="
+sudo -u "$RUN_USER" python3 -m venv "$INSTALL_DIR/.venv"
+sudo -u "$RUN_USER" "$INSTALL_DIR/.venv/bin/pip" install --upgrade pip requests urllib3
+
 # ==============================================================================
 # [10] APPLICATION CODE
 # ==============================================================================
@@ -338,3 +520,195 @@ if __name__=="__main__":
     _lock = acquire_singleton_lock(LOCK_PATH)
     Runner("/opt/ad-runner/config.json").run()
 PY
+
+# ==============================================================================
+# [11] SUPERVISOR
+# ==============================================================================
+echo "== Phase 7: Installing Supervisor =="
+sudo -u "$RUN_USER" tee "$INSTALL_DIR/supervisor.sh" >/dev/null <<'BASH'
+#!/bin/bash
+APP_DIR="/opt/ad-runner"
+VENV="$APP_DIR/.venv"
+# NO LOCK REMOVAL
+pkill -9 -u "$(whoami)" -f "mpv --fs" || true
+usage=$(df "$APP_DIR" | awk 'NR==2 {print $5}' | tr -d '%')
+if [ "$usage" -gt 90 ]; then rm -rf "$APP_DIR/cache/"*; fi
+exec "$VENV/bin/python3" "$APP_DIR/ad_runner.py"
+BASH
+sudo chmod +x "$INSTALL_DIR/supervisor.sh"
+
+# ==============================================================================
+# [12] UPDATER ENGINE
+# ==============================================================================
+echo "== Phase 8: Installing Updater =="
+
+sudo -u "$RUN_USER" tee "$BASE_DIR/updater.sh" >/dev/null <<'BASH'
+#!/bin/bash
+set -u
+
+BASE_DIR="/opt/flawk"
+DATA_DIR="$BASE_DIR/data"
+VERSIONS_DIR="$BASE_DIR/versions"
+CURRENT_LINK="$BASE_DIR/current"
+LOG_FILE="$DATA_DIR/logs/updater.log"
+CONFIG_FILE="$DATA_DIR/config.json"
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [UPDATER] $1" >> "$LOG_FILE"; }
+
+if [ ! -f "$CONFIG_FILE" ]; then exit 1; fi
+DEVICE_ID=$(jq -r .device_id "$CONFIG_FILE")
+MANIFEST_URL=$(jq -r .manifest_url "$CONFIG_FILE")
+if [ -z "$DEVICE_ID" ] || [ "$DEVICE_ID" == "null" ]; then exit 1; fi
+
+if [ "${1:-}" != "--force" ]; then
+    SLEEP_SEC=$((RANDOM % 1800))
+    sleep $SLEEP_SEC
+fi
+
+HTTP_CODE=$(curl -s -w "%{http_code}" -o /tmp/manifest_temp.json --max-time 15 "$MANIFEST_URL")
+if [ "$HTTP_CODE" != "200" ]; then exit 0; fi
+if ! jq -e . /tmp/manifest_temp.json >/dev/null 2>&1; then exit 0; fi
+JSON=$(cat /tmp/manifest_temp.json)
+
+TARGET_VER=$(echo "$JSON" | jq -r .stable.version)
+URL=$(echo "$JSON" | jq -r .stable.url)
+SUM=$(echo "$JSON" | jq -r .stable.shasum)
+ROLLOUT=$(echo "$JSON" | jq -r .stable.rollout_percent)
+
+IS_BETA=$(echo "$JSON" | jq -r --arg id "$DEVICE_ID" '.beta.devices[] | select(. == $id)')
+if [ -n "$IS_BETA" ]; then
+    TARGET_VER=$(echo "$JSON" | jq -r .beta.version)
+    URL=$(echo "$JSON" | jq -r .beta.url)
+    SUM=$(echo "$JSON" | jq -r .beta.shasum)
+    ROLLOUT=100
+fi
+
+HASH_NUM=$(echo -n "$DEVICE_ID" | cksum | awk '{print $1 % 100}')
+if [ "$ROLLOUT" != "100" ] && [ "$HASH_NUM" -ge "$ROLLOUT" ]; then exit 0; fi
+
+CURRENT_VER="unknown"
+if [ -f "$CURRENT_LINK/version.txt" ]; then CURRENT_VER=$(cat "$CURRENT_LINK/version.txt"); fi
+if [ "$CURRENT_VER" == "$TARGET_VER" ]; then exit 0; fi
+
+log "Update: $CURRENT_VER -> $TARGET_VER"
+
+NEW_DIR="$VERSIONS_DIR/$TARGET_VER"
+if [ -d "$NEW_DIR" ]; then rm -rf "$NEW_DIR"; fi
+mkdir -p "$NEW_DIR"
+
+TMP_FILE="/tmp/update_$TARGET_VER.tar.gz"
+if ! curl -L -s -o "$TMP_FILE" "$URL"; then log "Download failed."; exit 1; fi
+
+CALC_SUM=$(sha256sum "$TMP_FILE" | awk '{print $1}')
+if [ "$CALC_SUM" != "$SUM" ]; then log "Checksum mismatch!"; rm -f "$TMP_FILE"; exit 1; fi
+
+tar -xzf "$TMP_FILE" -C "$NEW_DIR"
+rm -f "$TMP_FILE"
+echo "$TARGET_VER" > "$NEW_DIR/version.txt"
+
+ln -sf "$DATA_DIR/config.json" "$NEW_DIR/config.json"
+ln -sf "$DATA_DIR/cache" "$NEW_DIR/cache"
+ln -sf "$DATA_DIR/logs" "$NEW_DIR/logs"
+
+python3 -m venv "$NEW_DIR/.venv"
+if [ -f "$NEW_DIR/requirements.txt" ]; then
+    "$NEW_DIR/.venv/bin/pip" install -r "$NEW_DIR/requirements.txt" --quiet
+fi
+
+OWNER=$(stat -c '%U' "$CONFIG_FILE")
+chown -R "$OWNER:$OWNER" "$NEW_DIR"
+
+ln -sfn "$NEW_DIR" "$BASE_DIR/next"
+mv -Tf "$BASE_DIR/next" "$CURRENT_LINK"
+
+log "Restarting service..."
+systemctl restart ad-runner.service
+sleep 20
+
+if systemctl is-active --quiet ad-runner.service; then
+    log "Update SUCCESS."
+else
+    log "CRITICAL: Service crashed. Rolling back."
+    PREV_DIR=$(ls -dt "$VERSIONS_DIR"/*/ | head -n 2 | tail -n 1)
+    if [ -n "$PREV_DIR" ]; then
+        ln -sfn "$PREV_DIR" "$BASE_DIR/rollback_link"
+        mv -Tf "$BASE_DIR/rollback_link" "$CURRENT_LINK"
+        systemctl restart ad-runner.service
+        log "Rollback done."
+    fi
+    exit 1
+fi
+
+ls -dt "$VERSIONS_DIR"/*/ | tail -n +3 | xargs rm -rf 2>/dev/null || true
+BASH
+sudo chmod +x "$BASE_DIR/updater.sh"
+
+(crontab -l 2>/dev/null; echo "0 3 * * * /bin/bash /opt/flawk/updater.sh") | crontab -
+
+# ==============================================================================
+# [13] FINAL LINKING & SYSTEMD
+# ==============================================================================
+echo "== Phase 9: Linking & Services =="
+ln -sf "$DATA_DIR/config.json" "$INSTALL_DIR/config.json"
+ln -sf "$DATA_DIR/cache" "$INSTALL_DIR/cache"
+ln -sf "$DATA_DIR/logs" "$INSTALL_DIR/logs"
+echo "$CURRENT_VER" > "$INSTALL_DIR/version.txt"
+
+ln -sfn "$INSTALL_DIR" "$BASE_DIR/current"
+ln -sfn "$BASE_DIR/current" "$LEGACY_APP_DIR"
+
+tee /etc/systemd/system/ad-runner.service >/dev/null <<UNIT
+[Unit]
+Description=Flawk Ad Runner (Production v0.0.8)
+After=network-online.target sound.target graphical-session.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$RUN_USER
+Group=$RUN_GROUP
+WorkingDirectory=$LEGACY_APP_DIR
+ExecStart=/bin/bash supervisor.sh
+Restart=always
+RestartSec=5
+StartLimitBurst=10
+StartLimitIntervalSec=60
+CPUWeight=1000
+Environment=DISPLAY=:0
+Environment=XDG_RUNTIME_DIR=/run/user/$RUN_UID
+StandardOutput=append:$LOG_DIR/service.log
+StandardError=inherit
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+tee /etc/logrotate.d/flawk-ad-runner >/dev/null <<ROT
+$LOG_DIR/*.log $DATA_DIR/logs/*.log {
+    size 10M
+    rotate 5
+    compress
+    missingok
+    notifempty
+    create 0644 $RUN_USER $RUN_GROUP
+}
+ROT
+
+# ==============================================================================
+# [14] FINALIZE
+# ==============================================================================
+echo "== Phase 10: Launching =="
+ensure_user_bus "$RUN_USER"
+systemctl daemon-reload
+systemctl enable --now ad-runner.service
+
+echo
+echo "=========================================="
+echo "   FLAWK AD RUNNER INSTALLED (v0.0.8)"
+echo "   - Config Tweaked (Cooldown 30s)"
+echo "   - Safe Mode (No apt-get)"
+echo "=========================================="
+echo " Device ID: $DEVICE_ID"
+echo " Status:    systemctl status ad-runner"
+echo " Logs:      tail -f $DATA_DIR/logs/ad_runner.log"
+echo "=========================================="
