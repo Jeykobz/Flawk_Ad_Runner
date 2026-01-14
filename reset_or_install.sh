@@ -200,6 +200,22 @@ LOCK_PATH = "/opt/ad-runner/ad_runner.lock"
 HEADERS = {"User-Agent":"FlawkAdRunner/0.0.9 (Linux; Production)","Accept":"application/xml,text/xml,*/*"}
 MPV_TIMEOUT_BUFFER = 40 
 
+# --- HELPER: Aggressive String Cleaner ---
+def clean_vast_str(s):
+    """Aggressively removes all whitespace (spaces, tabs, newlines) from a URL string."""
+    if not s: return ""
+    return re.sub(r'\s+', '', str(s))
+
+# --- HELPER: Strip XML Namespaces ---
+def remove_xml_namespaces(xml_string):
+    """Removes xmlns attributes to flatten the XML for easier parsing."""
+    try:
+        if isinstance(xml_string, bytes):
+            xml_string = xml_string.decode('utf-8', errors='ignore')
+        return re.sub(r' xmlns="[^"]+"', '', xml_string, count=0)
+    except:
+        return xml_string
+
 class IPv4HTTPAdapter(HTTPAdapter):
     def init_poolmanager(self, *args, **kwargs):
         fam = socket.AF_INET; orig = connection.allowed_gai_family
@@ -254,40 +270,44 @@ def _strip_ns(tag):
 def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
     if depth > max_depth: return None
     result = {"media_url": None, "duration": 15, "impressions": [], "trackers": {"start":[],"firstQuartile":[],"midpoint":[],"thirdQuartile":[],"complete":[]}}
-    try: root = ET.fromstring(xml_content)
+    
+    # 1. Clean XML String (Fixes Namespace issues)
+    clean_xml = remove_xml_namespaces(xml_content)
+    try: root = ET.fromstring(clean_xml)
     except: return None
 
-    ad_node = None
-    if _strip_ns(root.tag).upper() == "VAST":
-        ad_node = root.find(".//{*}Ad")
-        if ad_node is None: ad_node = root.find("Ad")
-    else: ad_node = root
-    if ad_node is None: return None
-
-    wrapper = ad_node.find(".//{*}Wrapper"); inline = ad_node.find(".//{*}Inline")
-    if wrapper is None: wrapper = ad_node.find("Wrapper")
-    if inline is None: inline = ad_node.find("Inline")
+    # 2. Simple Find (No Namespaces, Flat Search)
+    ad_node = root.find(".//Ad")
+    if ad_node is None: ad_node = root 
+    
+    wrapper = ad_node.find(".//Wrapper")
+    # Check casing for both InLine (Standard) and Inline (Typo)
+    inline = ad_node.find(".//InLine")
+    if inline is None: inline = ad_node.find(".//Inline")
+    
     active_node = wrapper if wrapper is not None else inline
     if active_node is None: return None
 
+    # 3. Clean Impressions (Fixes 404s)
     imps = set() 
-    for imp in active_node.findall(".//{*}Impression"):
-        if imp.text and imp.text.strip(): imps.add(imp.text.strip())
-    for imp in active_node.findall("Impression"):
-        if imp.text and imp.text.strip(): imps.add(imp.text.strip())
+    for imp in active_node.findall(".//Impression"):
+        val = clean_vast_str(imp.text)
+        if val: imps.add(val)
     result["impressions"] = list(imps)
 
-    for trk in active_node.findall(".//{*}Tracking"):
+    # 4. Clean Trackers
+    for trk in active_node.findall(".//Tracking"):
         evt = trk.get("event")
-        url = trk.text.strip() if trk.text else ""
+        url = clean_vast_str(trk.text)
         if evt in result["trackers"] and url and url not in result["trackers"][evt]: 
             result["trackers"][evt].append(url)
 
     if wrapper is not None:
-        tag_uri = wrapper.find(".//{*}VASTAdTagURI")
+        tag_uri = wrapper.find(".//VASTAdTagURI")
         if tag_uri is not None and tag_uri.text:
             try:
-                r = session.get(tag_uri.text.strip(), timeout=5)
+                wrapper_url = clean_vast_str(tag_uri.text)
+                r = session.get(wrapper_url, timeout=5)
                 if r.ok:
                     child = parse_vast_recursive(r.content, session, depth+1, max_depth)
                     if child:
@@ -299,36 +319,63 @@ def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
             except: pass
     elif inline is not None:
         candidates = []
-        for mf in inline.findall(".//{*}MediaFile"):
-            u = mf.text.strip() if mf.text else ""
+        for mf in inline.findall(".//MediaFile"):
+            u = clean_vast_str(mf.text)
             if not u: continue
+            
             typ = mf.get("type", "").lower()
             if "mp4" not in typ and not u.endswith(".mp4"): continue
+                
             w_str, h_str = mf.get("width"), mf.get("height")
             try: w = int(w_str) if w_str else 0; h = int(h_str) if h_str else 0
             except: w, h = 0, 0
             candidates.append({"url": u, "w": w, "h": h})
 
         if not candidates:
-            m = re.search(r'MediaFile.*?><!\[CDATA\[(.*?)\]\]>', xml_content.decode('utf-8', 'ignore'), re.S)
-            if m: result["media_url"] = m.group(1).strip()
+            # Fallback Regex within Smart Parser
+            m = re.search(r'MediaFile.*?><!\[CDATA\[(.*?)\]\]>', clean_xml, re.S)
+            if m: result["media_url"] = clean_vast_str(m.group(1))
         elif len(candidates) == 1:
             result["media_url"] = candidates[0]["url"]
         else:
-            candidates.sort(key=lambda c: min(abs(c["h"] - 720), abs(c["h"] - 1080)))
+            def score_fn(c):
+                h = c["h"]
+                if h <= 0: return 999999
+                return min(abs(h - 720), abs(h - 1080))
+            candidates.sort(key=score_fn)
             result["media_url"] = candidates[0]["url"]
 
-        dn = inline.find(".//{*}Duration")
+        dn = inline.find(".//Duration")
         if dn is not None and dn.text: result["duration"] = parse_duration(dn.text)
     return result
 
 def parse_legacy_fallback(txt):
+    # CDATA Regex
     media = re.search(r'MediaFile.*?><!\[CDATA\[(.*?)\]\]>', txt, re.S)
-    if not media: media = re.search(r'MediaFile.*?>(http.*?)<', txt, re.S)
+    if not media: 
+        # Simple Tag Regex (Handles attributes and whitespace)
+        media = re.search(r'MediaFile.*?>\s*(http.*?)\s*<', txt, re.S)
+    
     if not media: return None
+    
     dur_m = re.search(r'<Duration>(.*?)</Duration>', txt)
     dur = parse_duration(dur_m.group(1)) if dur_m else 15
-    return { "media_url": media.group(1).strip(), "duration": dur, "impressions": [], "trackers": {} }
+    
+    # Impressions (CDATA + Simple)
+    raw_imps = re.findall(r'<Impression.*?><!\[CDATA\[(.*?)\]\]>', txt, re.S)
+    raw_imps += re.findall(r'<Impression.*?>\s*(http.*?)\s*<', txt, re.S)
+    
+    clean_imps = set()
+    for raw in raw_imps:
+        c = clean_vast_str(raw)
+        if c: clean_imps.add(c)
+
+    return {
+        "media_url": clean_vast_str(media.group(1)),
+        "duration": dur,
+        "impressions": list(clean_imps),
+        "trackers": {}
+    }
 
 class Log:
     def __init__(self, logfile):
@@ -377,16 +424,38 @@ def duck_others(mute=True, snapshot=None):
 def download_if_needed(url, cache_dir, session):
     enforce_cache_budget(cache_dir)
     ensure_dir(cache_dir)
+    
+    # 1. Clean URL (Fixes Random Hashes)
+    url = clean_vast_str(url)
+    
     ext = os.path.splitext(up.urlparse(url).path)[1] or ".mp4"
     path = os.path.join(cache_dir, sha256_hex(url)+ext)
-    if os.path.exists(path) and os.path.getsize(path)>0: return path
+    
+    # 2. Check Exists & Size
+    if os.path.exists(path):
+        if os.path.getsize(path) > 1024:
+            return path
+        else:
+            try: os.unlink(path) # Delete corrupt 0-byte file
+            except: pass
+
     try:
         r = session.get(url, timeout=60, stream=True)
         if not r.ok: return url
-        with open(path,"wb") as f:
+        
+        # 3. Atomic Write (Prevents half-downloads)
+        temp_path = path + ".tmp"
+        with open(temp_path, "wb") as f:
             for chunk in r.iter_content(8192):
                 if chunk: f.write(chunk)
-        return path
+        
+        # 4. Verify & Rename
+        if os.path.getsize(temp_path) > 1024:
+            os.rename(temp_path, path)
+            return path
+        else:
+            os.unlink(temp_path)
+            return url
     except: return url
 
 class Runner:
@@ -421,9 +490,21 @@ class Runner:
             time.sleep(60)
 
     def req_url(self): return f"{self.api}?device_id={self.device}&api_key={self.api_key}"
+
     def _net_task(self, url, label):
-        try: self.http.get(url, timeout=5)
-        except: pass
+        try:
+            # Added a user-agent specifically for tracking to avoid bot blocks
+            headers = {"User-Agent": "FlawkAdRunner/0.0.29"} 
+            r = self.http.get(url, headers=headers, timeout=5)
+            
+            if 200 <= r.status_code < 300:
+                self.log.info(f"Trk {label} -> {r.status_code}")
+            else:
+                # NOW LOGS ERRORS
+                self.log.warn(f"Trk {label} FAILED -> {r.status_code} ({url})")
+        except Exception as e:
+            # NOW LOGS EXCEPTIONS
+            self.log.err(f"Trk {label} ERROR -> {e} ({url})")
 
     def fire_delayed(self, delay, urls, label):
         def t():
