@@ -762,6 +762,7 @@ Restart=always
 RestartSec=5
 StartLimitBurst=10
 StartLimitIntervalSec=60
+Nice=-15
 CPUWeight=1000
 Environment=DISPLAY=:0
 Environment=XAUTHORITY=/home/$RUN_USER/.Xauthority
