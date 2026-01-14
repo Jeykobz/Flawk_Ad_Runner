@@ -201,16 +201,18 @@ HEADERS = {"User-Agent":"FlawkAdRunner/0.0.8 (Linux; Production)","Accept":"appl
 MPV_TIMEOUT_BUFFER = 40 
 
 def clean_vast_str(s):
-    """Aggressively removes all whitespace (spaces, tabs, newlines) from a URL string."""
+    """Safely removes surrounding whitespace."""
     if not s: return ""
-    return re.sub(r'\s+', '', str(s))
+    # .strip() is safer than re.sub(r'\s+') for URLs which might have legitimate encoded chars
+    return str(s).strip()
 
 def remove_xml_namespaces(xml_string):
-    """Removes xmlns attributes to flatten the XML for easier parsing."""
+    """Robustly removes xmlns attributes including xmlns:xsi, single quotes, etc."""
     try:
         if isinstance(xml_string, bytes):
             xml_string = xml_string.decode('utf-8', errors='ignore')
-        return re.sub(r' xmlns="[^"]+"', '', xml_string, count=0)
+        # Remove xmlns attributes (e.g. xmlns="...", xmlns:xsi='...')
+        return re.sub(r' xmlns:?[^=]*=["\'][^"\']*["\']', '', xml_string)
     except:
         return xml_string
 
