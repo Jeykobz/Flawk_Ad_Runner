@@ -200,6 +200,12 @@ LOCK_PATH = "/opt/ad-runner/ad_runner.lock"
 HEADERS = {"User-Agent":"FlawkAdRunner/0.0.8 (Linux; Production)","Accept":"application/xml,text/xml,*/*"}
 MPV_TIMEOUT_BUFFER = 40 
 
+def clean_vast_str(s):
+    """Aggressively removes all whitespace (spaces, tabs, newlines) from a URL string."""
+    if not s: return ""
+    # Remove any character that is a whitespace
+    return re.sub(r'\s+', '', str(s))
+
 class IPv4HTTPAdapter(HTTPAdapter):
     def init_poolmanager(self, *args, **kwargs):
         fam = socket.AF_INET; orig = connection.allowed_gai_family
@@ -275,22 +281,34 @@ def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
     else: ad_node = root
     if ad_node is None: return None
 
-    wrapper = ad_node.find(".//{*}Wrapper"); inline = ad_node.find(".//{*}Inline")
+    wrapper = ad_node.find(".//{*}Wrapper")
+    inline = ad_node.find(".//{*}InLine")
+    
     if wrapper is None: wrapper = ad_node.find("Wrapper")
-    if inline is None: inline = ad_node.find("Inline")
+    if inline is None: inline = ad_node.find("InLine") # Fixed casing here
+    
     active_node = wrapper if wrapper is not None else inline
-    if active_node is None: return None
+    if active_node is None: 
+        # Fallback check for lowercase 'Inline' just in case of weird VAST providers
+        inline_legacy = ad_node.find(".//{*}Inline")
+        if inline_legacy is None: inline_legacy = ad_node.find("Inline")
+        if inline_legacy is not None: active_node = inline_legacy
+        else: return None
 
+    # --- CLEAN IMPRESSIONS ---
     imps = set() 
     for imp in active_node.findall(".//{*}Impression"):
-        if imp.text and imp.text.strip(): imps.add(imp.text.strip())
+        val = clean_vast_str(imp.text)
+        if val: imps.add(val)
     for imp in active_node.findall("Impression"):
-        if imp.text and imp.text.strip(): imps.add(imp.text.strip())
+        val = clean_vast_str(imp.text)
+        if val: imps.add(val)
     result["impressions"] = list(imps)
 
+    # --- CLEAN TRACKERS ---
     for trk in active_node.findall(".//{*}Tracking"):
         evt = trk.get("event")
-        url = trk.text.strip() if trk.text else ""
+        url = clean_vast_str(trk.text)
         if evt in result["trackers"] and url and url not in result["trackers"][evt]: 
             result["trackers"][evt].append(url)
 
@@ -299,7 +317,8 @@ def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
         if tag_uri is None: tag_uri = wrapper.find("VASTAdTagURI")
         if tag_uri is not None and tag_uri.text:
             try:
-                r = session.get(tag_uri.text.strip(), timeout=5)
+                wrapper_url = clean_vast_str(tag_uri.text)
+                r = session.get(wrapper_url, timeout=5)
                 if r.ok:
                     child = parse_vast_recursive(r.content, session, depth+1, max_depth)
                     if child:
@@ -312,7 +331,7 @@ def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
     elif inline is not None:
         candidates = []
         for mf in inline.findall(".//{*}MediaFile"):
-            u = mf.text.strip() if mf.text else ""
+            u = clean_vast_str(mf.text)
             if not u: continue
             
             typ = mf.get("type", "").lower()
@@ -325,7 +344,7 @@ def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
 
         if not candidates:
             m = re.search(r'MediaFile.*?><!\[CDATA\[(.*?)\]\]>', xml_content.decode('utf-8', 'ignore'), re.S)
-            if m: result["media_url"] = m.group(1).strip()
+            if m: result["media_url"] = clean_vast_str(m.group(1))
         elif len(candidates) == 1:
             result["media_url"] = candidates[0]["url"]
         else:
@@ -341,15 +360,32 @@ def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
     return result
 
 def parse_legacy_fallback(txt):
+    # Try to find MediaFile (CDATA or Simple)
     media = re.search(r'MediaFile.*?><!\[CDATA\[(.*?)\]\]>', txt, re.S)
-    if not media: media = re.search(r'MediaFile.*?>(http.*?)<', txt, re.S)
+    if not media: 
+        # Fallback to simple tag, capturing http... up to the closing <
+        media = re.search(r'MediaFile.*?>\s*(http.*?)\s*<', txt, re.S)
+    
     if not media: return None
+    
     dur_m = re.search(r'<Duration>(.*?)</Duration>', txt)
     dur = parse_duration(dur_m.group(1)) if dur_m else 15
+    
+    # Find Impressions (CDATA)
+    raw_imps = re.findall(r'<Impression.*?><!\[CDATA\[(.*?)\]\]>', txt, re.S)
+    # Find Impressions (Simple) - crucial for your Hivestack VAST
+    raw_imps += re.findall(r'<Impression.*?>\s*(http.*?)\s*<', txt, re.S)
+    
+    # Clean and Deduplicate
+    clean_imps = set()
+    for raw in raw_imps:
+        c = clean_vast_str(raw)
+        if c: clean_imps.add(c)
+
     return {
-        "media_url": media.group(1).strip(),
+        "media_url": clean_vast_str(media.group(1)),
         "duration": dur,
-        "impressions": list(set(re.findall(r'<Impression.*?><!\[CDATA\[(.*?)\]\]>', txt, re.S))),
+        "impressions": list(clean_imps),
         "trackers": {}
     }
 
@@ -405,16 +441,39 @@ def duck_others(mute=True, snapshot=None):
 def download_if_needed(url, cache_dir, session):
     enforce_cache_budget(cache_dir)
     ensure_dir(cache_dir)
+    
+    # 1. Clean URL again to be safe
+    url = clean_vast_str(url)
+    
     ext = os.path.splitext(up.urlparse(url).path)[1] or ".mp4"
     path = os.path.join(cache_dir, sha256_hex(url)+ext)
-    if os.path.exists(path) and os.path.getsize(path)>0: return path
+    
+    # 2. Check if existing file is valid (larger than 1KB)
+    if os.path.exists(path):
+        if os.path.getsize(path) > 1024:
+            return path
+        else:
+            # File is corrupt/empty, delete it
+            try: os.unlink(path)
+            except: pass
+
     try:
         r = session.get(url, timeout=60, stream=True)
         if not r.ok: return url
-        with open(path,"wb") as f:
+        
+        # 3. Download to temp file first (atomic write)
+        temp_path = path + ".tmp"
+        with open(temp_path, "wb") as f:
             for chunk in r.iter_content(8192):
                 if chunk: f.write(chunk)
-        return path
+        
+        # 4. Verify download before finalizing
+        if os.path.getsize(temp_path) > 1024:
+            os.rename(temp_path, path)
+            return path
+        else:
+            os.unlink(temp_path)
+            return url
     except: return url
 
 class Runner:
