@@ -437,38 +437,47 @@ def download_if_needed(url, cache_dir, session):
     enforce_cache_budget(cache_dir)
     ensure_dir(cache_dir)
     
-    # [CHANGE 1] Clean URL before hashing
     url = clean_vast_str(url)
-    
+    if not url: return None
+
     ext = os.path.splitext(up.urlparse(url).path)[1] or ".mp4"
-    path = os.path.join(cache_dir, sha256_hex(url)+ext)
+    # Use the cleaned URL for hashing
+    filename = sha256_hex(url) + ext
+    path = os.path.join(cache_dir, filename)
     
-    # [CHANGE 2] Validate existing file size
     if os.path.exists(path):
         if os.path.getsize(path) > 1024:
             return path
         else:
-            try: os.unlink(path) # Delete corrupt 0-byte file
+            try: os.unlink(path)
             except: pass
 
     try:
-        r = session.get(url, timeout=60, stream=True)
-        if not r.ok: return url
+        # [FIX] Do not use the global API headers (Accept: xml) for video files
+        # We create a clean set of headers for the file download
+        dl_headers = {"User-Agent": "FlawkAdRunner/0.0.8", "Accept": "*/*"}
         
-        # [CHANGE 3] Atomic Write (Download to .tmp first)
+        r = session.get(url, headers=dl_headers, timeout=60, stream=True)
+        
+        if not r.ok:
+            print(f"[WARN] Download Failed {r.status_code}: {url}") # Simple print to show up in systemd logs
+            return url
+        
         temp_path = path + ".tmp"
         with open(temp_path, "wb") as f:
             for chunk in r.iter_content(8192):
                 if chunk: f.write(chunk)
         
-        # Verify and Rename
         if os.path.getsize(temp_path) > 1024:
             os.rename(temp_path, path)
             return path
         else:
+            print(f"[WARN] Download too small ({os.path.getsize(temp_path)}b): {url}")
             os.unlink(temp_path)
             return url
-    except: return url
+    except Exception as e:
+        print(f"[ERR] Download Exception: {e}")
+        return url
 
 class Runner:
     def __init__(self, cfg_path):
