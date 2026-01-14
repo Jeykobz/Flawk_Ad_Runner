@@ -601,11 +601,6 @@ class Runner:
                "--cursor-autohide=always", "--osc=no", #"--prefetch-playlist=yes",
                "--vo=gpu", "--gpu-context=x11" if os.environ.get("DISPLAY") else "--gpu-context=drm",
                f"--log-file=/var/log/ad-runner/mpv_player.log"]
-
-        if os.environ.get("DISPLAY"):
-             cmd.extend(["--vo=gpu", "--gpu-context=x11"])
-        else:
-             cmd.extend(["--vo=gpu", "--gpu-context=drm"])
         
         if is_muted: cmd.append("--mute=yes")
         cmd = cmd + paths
