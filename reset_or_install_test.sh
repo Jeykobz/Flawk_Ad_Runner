@@ -490,9 +490,21 @@ class Runner:
             time.sleep(60)
 
     def req_url(self): return f"{self.api}?device_id={self.device}&api_key={self.api_key}"
+
     def _net_task(self, url, label):
-        try: self.http.get(url, timeout=5)
-        except: pass
+        try:
+            # Added a user-agent specifically for tracking to avoid bot blocks
+            headers = {"User-Agent": "FlawkAdRunner/0.0.29"} 
+            r = self.http.get(url, headers=headers, timeout=5)
+            
+            if 200 <= r.status_code < 300:
+                self.log.info(f"Trk {label} -> {r.status_code}")
+            else:
+                # NOW LOGS ERRORS
+                self.log.warn(f"Trk {label} FAILED -> {r.status_code} ({url})")
+        except Exception as e:
+            # NOW LOGS EXCEPTIONS
+            self.log.err(f"Trk {label} ERROR -> {e} ({url})")
 
     def fire_delayed(self, delay, urls, label):
         def t():
