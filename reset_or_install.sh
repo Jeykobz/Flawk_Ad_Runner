@@ -203,8 +203,16 @@ MPV_TIMEOUT_BUFFER = 40
 def clean_vast_str(s):
     """Aggressively removes all whitespace (spaces, tabs, newlines) from a URL string."""
     if not s: return ""
-    # Remove any character that is a whitespace
     return re.sub(r'\s+', '', str(s))
+
+def remove_xml_namespaces(xml_string):
+    """Removes xmlns attributes to flatten the XML for easier parsing."""
+    try:
+        if isinstance(xml_string, bytes):
+            xml_string = xml_string.decode('utf-8', errors='ignore')
+        return re.sub(r' xmlns="[^"]+"', '', xml_string, count=0)
+    except:
+        return xml_string
 
 class IPv4HTTPAdapter(HTTPAdapter):
     def init_poolmanager(self, *args, **kwargs):
@@ -267,54 +275,42 @@ def _strip_ns(tag):
     if '}' in tag: return tag.split('}', 1)[1]
     return tag
 
-# --- SMART PARSER (Media Selection + Recursion) ---
 def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
     if depth > max_depth: return None
     result = {"media_url": None, "duration": 15, "impressions": [], "trackers": {"start":[],"firstQuartile":[],"midpoint":[],"thirdQuartile":[],"complete":[]}}
-    try: root = ET.fromstring(xml_content)
+    
+    # [CHANGE 1] STRIP NAMESPACES
+    clean_xml = remove_xml_namespaces(xml_content)
+    try: root = ET.fromstring(clean_xml)
     except: return None
 
-    ad_node = None
-    if _strip_ns(root.tag).upper() == "VAST":
-        ad_node = root.find(".//{*}Ad")
-        if ad_node is None: ad_node = root.find("Ad")
-    else: ad_node = root
-    if ad_node is None: return None
-
-    wrapper = ad_node.find(".//{*}Wrapper")
-    inline = ad_node.find(".//{*}InLine")
+    # [CHANGE 2] SIMPLE SEARCH (No {*} syntax)
+    ad_node = root.find(".//Ad")
+    if ad_node is None: ad_node = root 
     
-    if wrapper is None: wrapper = ad_node.find("Wrapper")
-    if inline is None: inline = ad_node.find("InLine") # Fixed casing here
+    # [CHANGE 3] CASE-INSENSITIVE CHECK
+    wrapper = ad_node.find(".//Wrapper")
+    inline = ad_node.find(".//InLine")
+    if inline is None: inline = ad_node.find(".//Inline") # Check Typo
     
     active_node = wrapper if wrapper is not None else inline
-    if active_node is None: 
-        # Fallback check for lowercase 'Inline' just in case of weird VAST providers
-        inline_legacy = ad_node.find(".//{*}Inline")
-        if inline_legacy is None: inline_legacy = ad_node.find("Inline")
-        if inline_legacy is not None: active_node = inline_legacy
-        else: return None
+    if active_node is None: return None
 
-    # --- CLEAN IMPRESSIONS ---
+    # [CHANGE 4] CLEAN WHITESPACE ON EXTRACTION
     imps = set() 
-    for imp in active_node.findall(".//{*}Impression"):
-        val = clean_vast_str(imp.text)
-        if val: imps.add(val)
-    for imp in active_node.findall("Impression"):
+    for imp in active_node.findall(".//Impression"):
         val = clean_vast_str(imp.text)
         if val: imps.add(val)
     result["impressions"] = list(imps)
 
-    # --- CLEAN TRACKERS ---
-    for trk in active_node.findall(".//{*}Tracking"):
+    for trk in active_node.findall(".//Tracking"):
         evt = trk.get("event")
         url = clean_vast_str(trk.text)
         if evt in result["trackers"] and url and url not in result["trackers"][evt]: 
             result["trackers"][evt].append(url)
 
     if wrapper is not None:
-        tag_uri = wrapper.find(".//{*}VASTAdTagURI")
-        if tag_uri is None: tag_uri = wrapper.find("VASTAdTagURI")
+        tag_uri = wrapper.find(".//VASTAdTagURI")
         if tag_uri is not None and tag_uri.text:
             try:
                 wrapper_url = clean_vast_str(tag_uri.text)
@@ -330,7 +326,7 @@ def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
             except: pass
     elif inline is not None:
         candidates = []
-        for mf in inline.findall(".//{*}MediaFile"):
+        for mf in inline.findall(".//MediaFile"):
             u = clean_vast_str(mf.text)
             if not u: continue
             
@@ -343,7 +339,8 @@ def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
             candidates.append({"url": u, "w": w, "h": h})
 
         if not candidates:
-            m = re.search(r'MediaFile.*?><!\[CDATA\[(.*?)\]\]>', xml_content.decode('utf-8', 'ignore'), re.S)
+            # Fallback regex on clean XML
+            m = re.search(r'MediaFile.*?><!\[CDATA\[(.*?)\]\]>', clean_xml, re.S)
             if m: result["media_url"] = clean_vast_str(m.group(1))
         elif len(candidates) == 1:
             result["media_url"] = candidates[0]["url"]
@@ -355,15 +352,14 @@ def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
             candidates.sort(key=score_fn)
             result["media_url"] = candidates[0]["url"]
 
-        dn = inline.find(".//{*}Duration")
+        dn = inline.find(".//Duration")
         if dn is not None and dn.text: result["duration"] = parse_duration(dn.text)
     return result
 
 def parse_legacy_fallback(txt):
-    # Try to find MediaFile (CDATA or Simple)
     media = re.search(r'MediaFile.*?><!\[CDATA\[(.*?)\]\]>', txt, re.S)
     if not media: 
-        # Fallback to simple tag, capturing http... up to the closing <
+        # [CHANGE] Support simple tags with spaces
         media = re.search(r'MediaFile.*?>\s*(http.*?)\s*<', txt, re.S)
     
     if not media: return None
@@ -371,12 +367,9 @@ def parse_legacy_fallback(txt):
     dur_m = re.search(r'<Duration>(.*?)</Duration>', txt)
     dur = parse_duration(dur_m.group(1)) if dur_m else 15
     
-    # Find Impressions (CDATA)
     raw_imps = re.findall(r'<Impression.*?><!\[CDATA\[(.*?)\]\]>', txt, re.S)
-    # Find Impressions (Simple) - crucial for your Hivestack VAST
     raw_imps += re.findall(r'<Impression.*?>\s*(http.*?)\s*<', txt, re.S)
     
-    # Clean and Deduplicate
     clean_imps = set()
     for raw in raw_imps:
         c = clean_vast_str(raw)
@@ -442,32 +435,31 @@ def download_if_needed(url, cache_dir, session):
     enforce_cache_budget(cache_dir)
     ensure_dir(cache_dir)
     
-    # 1. Clean URL again to be safe
+    # [CHANGE 1] Clean URL before hashing
     url = clean_vast_str(url)
     
     ext = os.path.splitext(up.urlparse(url).path)[1] or ".mp4"
     path = os.path.join(cache_dir, sha256_hex(url)+ext)
     
-    # 2. Check if existing file is valid (larger than 1KB)
+    # [CHANGE 2] Validate existing file size
     if os.path.exists(path):
         if os.path.getsize(path) > 1024:
             return path
         else:
-            # File is corrupt/empty, delete it
-            try: os.unlink(path)
+            try: os.unlink(path) # Delete corrupt 0-byte file
             except: pass
 
     try:
         r = session.get(url, timeout=60, stream=True)
         if not r.ok: return url
         
-        # 3. Download to temp file first (atomic write)
+        # [CHANGE 3] Atomic Write (Download to .tmp first)
         temp_path = path + ".tmp"
         with open(temp_path, "wb") as f:
             for chunk in r.iter_content(8192):
                 if chunk: f.write(chunk)
         
-        # 4. Verify download before finalizing
+        # Verify and Rename
         if os.path.getsize(temp_path) > 1024:
             os.rename(temp_path, path)
             return path
