@@ -183,7 +183,7 @@ sudo -u "$RUN_USER" "$INSTALL_DIR/.venv/bin/pip" install --upgrade pip requests 
 # ==============================================================================
 # [10] APPLICATION CODE
 # ==============================================================================
-echo "== Phase 6: Installing App Logic (v0.0.8 - Debug Enabled) =="
+echo "== Phase 6: Installing App Logic (v0.0.9 - Debug & Auto-Context) =="
 
 sudo -u "$RUN_USER" tee "$INSTALL_DIR/ad_runner.py" >/dev/null <<'PY'
 #!/usr/bin/env python3
@@ -197,7 +197,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util import connection, Retry
 
 LOCK_PATH = "/opt/ad-runner/ad_runner.lock"
-HEADERS = {"User-Agent":"FlawkAdRunner/0.0.8 (Linux; Production)","Accept":"application/xml,text/xml,*/*"}
+HEADERS = {"User-Agent":"FlawkAdRunner/0.0.9 (Linux; Production)","Accept":"application/xml,text/xml,*/*"}
 MPV_TIMEOUT_BUFFER = 40 
 
 class IPv4HTTPAdapter(HTTPAdapter):
@@ -234,17 +234,12 @@ def parse_duration(t:str)->int:
         try: return int(float(s))
         except: return 0
     try:
-        colons = s.count(':')
-        if colons == 3: parts = s.rsplit(':', 1); s = f"{parts[0]}.{parts[1]}"
-        elif ',' in s: s = s.replace(',', '.')
-        if '.' in s:
-            main, ms = s.split('.'); hh, mm, ss = main.split(':')
-            return int(hh)*3600 + int(mm)*60 + int(ss)
-        else:
-            hh, mm, ss = s.split(':')
-            return int(hh)*3600 + int(mm)*60 + int(ss)
-    except Exception:
-        return 15
+        if '.' in s: s = s.split('.')[0]
+        parts = s.split(':')
+        if len(parts) == 3: return int(parts[0])*3600 + int(parts[1])*60 + int(parts[2])
+        if len(parts) == 2: return int(parts[0])*60 + int(parts[1])
+    except: pass
+    return 15
 
 def replace_macros(url, duration, playhead):
     ts=int(time.time()); cb=str(random.randint(10000000,99999999))
@@ -290,7 +285,6 @@ def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
 
     if wrapper is not None:
         tag_uri = wrapper.find(".//{*}VASTAdTagURI")
-        if tag_uri is None: tag_uri = wrapper.find("VASTAdTagURI")
         if tag_uri is not None and tag_uri.text:
             try:
                 r = session.get(tag_uri.text.strip(), timeout=5)
@@ -476,34 +470,48 @@ class Runner:
         
         subprocess.run(["pkill", "-9", "-f", "mpv --fs"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
-        # LOGGING SETUP: Use the log directory from config (safe permissions)
+        # LOGGING SETUP - Save to same dir as main log
         log_dir = os.path.dirname(self.cfg.get("log_file"))
-        mpv_log = os.path.join(log_dir, "mpv_debug.log")
+        mpv_log = os.path.join(log_dir, "mpv_playback.log")
 
+        # MPV COMMAND - Auto Context & Logging
         cmd = ["mpv", "--fs", "--no-border", 
-               "--msg-level=all=v", f"--log-file={mpv_log}",
+               f"--log-file={mpv_log}", "--msg-level=all=warn,vo=debug",
                "--ontop", "--force-window=immediate", "--keep-open=no",
                "--geometry=100%x100%", "--autofit=100%",
                "--input-default-bindings=no", "--input-vo-keyboard=no", 
-               "--cursor-autohide=always", "--osc=no", "--vo=gpu"]
-        
-        if os.environ.get("DISPLAY"): cmd.append("--gpu-context=x11")
-        else: cmd.append("--gpu-context=drm")
+               "--cursor-autohide=always", "--osc=no", 
+               "--vo=gpu", "--gpu-context=auto"] # CHANGED: Auto context
 
         if is_muted: cmd.append("--mute=yes")
         cmd = cmd + paths
         
-        env = os.environ.copy(); env["DISPLAY"] = env.get("DISPLAY", ":0")
+        env = os.environ.copy()
+        env["DISPLAY"] = env.get("DISPLAY", ":0")
+        
+        # FIX: Ensure XAUTHORITY is set for Systemd
+        if "XAUTHORITY" not in env:
+            xauth = os.path.expanduser("~/.Xauthority")
+            if os.path.exists(xauth): env["XAUTHORITY"] = xauth
         
         self.log.info(f"Playing Batch. Total: {total_sec}s")
-        try: subprocess.run(cmd, env=env, check=False, timeout=total_sec + MPV_TIMEOUT_BUFFER)
-        except subprocess.TimeoutExpired: subprocess.run(["pkill", "-9", "-f", "mpv --fs"], stdout=subprocess.DEVNULL)
+        
+        try:
+            # CAPTURE STDOUT/STDERR for debugging code 1
+            result = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=total_sec + MPV_TIMEOUT_BUFFER)
+            if result.returncode != 0:
+                self.log.err(f"MPV Failed (Code {result.returncode}).\nLAST LOG LINES:\n" + "\n".join(result.stdout.splitlines()[-15:]))
+        except subprocess.TimeoutExpired:
+            self.log.err("MPV Timeout. Killing.")
+            subprocess.run(["pkill", "-9", "-f", "mpv --fs"], stdout=subprocess.DEVNULL)
+        except Exception as e:
+            self.log.err(f"MPV Execution Error: {e}")
         
         if snap: duck_others(False, snap)
         return len(items)
 
     def run(self):
-        self.log.info(f"Runner Start v0.0.8. ID={self.device}")
+        self.log.info(f"Runner Start v0.0.9. ID={self.device}")
         time.sleep(self.cfg.get("initial_start_delay_secs", 10))
         while True:
             while len(self.queue) < self.cfg.get("queue_max",5):
@@ -659,7 +667,7 @@ ln -sfn "$BASE_DIR/current" "$LEGACY_APP_DIR"
 
 tee /etc/systemd/system/ad-runner.service >/dev/null <<UNIT
 [Unit]
-Description=Flawk Ad Runner (Production v0.0.8)
+Description=Flawk Ad Runner (Production v0.0.9)
 After=network-online.target sound.target graphical-session.target
 Wants=network-online.target
 
@@ -675,6 +683,7 @@ StartLimitBurst=10
 StartLimitIntervalSec=60
 CPUWeight=1000
 Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/$RUN_USER/.Xauthority
 Environment=XDG_RUNTIME_DIR=/run/user/$RUN_UID
 StandardOutput=append:$LOG_DIR/service.log
 StandardError=inherit
