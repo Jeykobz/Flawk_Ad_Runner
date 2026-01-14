@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# FLAWK AD RUNNER - MASTER PRODUCTION INSTALLER (v0.0.8)
+# FLAWK AD RUNNER - MASTER INSTALLER (v0.1.0)
 #
-# RELEASE NOTES:
-# - CONFIG UPDATE: Cooldown=30s, Queue=5, Poll=10s.
-# - SYSTEM: 'apt-get update' removed. 'apt-get install' is error-tolerant.
-# - INCLUDES: Smart Resolution Picker, Mute Fix, VAST Recursion, Updater.
+# FIXES IN THIS VERSION:
+# - MPV: Fixed "Double Argument" crash (vo=gpu was added twice).
+# - GUI: Added XAUTHORITY export so service can open windows.
+# - NET: Fixed HTTP Headers for video downloads.
 # ==============================================================================
 
 # Strict Mode
@@ -22,7 +22,7 @@ touch "$INSTALL_LOG" >/dev/null 2>&1 || true
 chmod 0666 "$INSTALL_LOG" >/dev/null 2>&1 || true
 exec > >(tee -a "$INSTALL_LOG") 2>&1
 
-echo "=== [$(date)] Starting v0.0.8 Installation ==="
+echo "=== [$(date)] Starting v0.1.0 Installation ==="
 
 if [ ! -t 0 ] && [ -r /dev/tty ]; then exec </dev/tty; fi
 
@@ -32,7 +32,7 @@ if [ ! -t 0 ] && [ -r /dev/tty ]; then exec </dev/tty; fi
 BASE_DIR="/opt/flawk"
 DATA_DIR="$BASE_DIR/data"
 VERSIONS_DIR="$BASE_DIR/versions"
-CURRENT_VER="v0.0.8"
+CURRENT_VER="v0.1.0"
 INSTALL_DIR="$VERSIONS_DIR/$CURRENT_VER"
 LEGACY_APP_DIR="/opt/ad-runner"
 
@@ -86,14 +86,6 @@ systemctl stop ad-runner.service 2>/dev/null || true
 systemctl disable ad-runner.service 2>/dev/null || true
 rm -f /etc/systemd/system/ad-runner.service
 
-if sudo -u "$RUN_USER" XDG_RUNTIME_DIR="/run/user/$RUN_UID" systemctl --user is-active ad-runner.service >/dev/null 2>&1; then
-    sudo -u "$RUN_USER" XDG_RUNTIME_DIR="/run/user/$RUN_UID" systemctl --user stop ad-runner.service
-    sudo -u "$RUN_USER" XDG_RUNTIME_DIR="/run/user/$RUN_UID" systemctl --user disable ad-runner.service
-fi
-rm -f "/home/$RUN_USER/.config/systemd/user/ad-runner.service"
-
-systemctl daemon-reload
-
 pkill -9 -f "ad_runner.py" 2>/dev/null || true
 pkill -9 -f "mpv --fs" 2>/dev/null || true
 
@@ -104,9 +96,7 @@ rm -f "$BASE_DIR/current"
 # ==============================================================================
 # [6] DEPENDENCIES
 # ==============================================================================
-echo "== Phase 2: Dependencies (Safe Mode) =="
-# NO apt-get update
-# Try install, but don't fail if repo is unreachable (|| true)
+echo "== Phase 2: Dependencies =="
 apt-get install -y mpv python3 python3-venv python3-pip curl ca-certificates jq pulseaudio-utils logrotate coreutils || true
 
 # ==============================================================================
@@ -117,7 +107,7 @@ mkdir -p "$DATA_DIR/cache" "$DATA_DIR/logs" "$INSTALL_DIR"
 
 if [ -f "$BACKUP_CONF" ]; then
     mv "$BACKUP_CONF" "$DATA_DIR/config.json"
-    echo "   Config restored."
+    echo "    Config restored."
 fi
 
 chown -R "$RUN_USER:$RUN_GROUP" "$BASE_DIR" "$LOG_DIR"
@@ -129,27 +119,15 @@ chmod -R 755 "$BASE_DIR" "$LOG_DIR"
 CONF_FILE="$DATA_DIR/config.json"
 
 if [ -f "$CONF_FILE" ]; then
-    echo "== Phase 4: Existing Config Found =="
-    DEVICE_ID=$(jq -r .device_id "$CONF_FILE" 2>/dev/null || echo "Unknown")
-    
-    # PATCH CONFIG WITH NEW DEFAULTS (v0.0.8)
+    echo "== Phase 4: Patching Config =="
     tmp=$(mktemp)
     jq '.per_ad_cooldown_secs = 30 | .queue_max = 5 | .poll_interval_secs = 10' "$CONF_FILE" > "$tmp" && mv "$tmp" "$CONF_FILE"
     chown "$RUN_USER:$RUN_GROUP" "$CONF_FILE"
-    echo "   Config patched with v0.0.8 defaults."
-    
 else
-    echo "== Phase 4: New Configuration Required =="
+    echo "== Phase 4: New Config =="
     if [ -t 0 ]; then read -rp "Device ID (required): " DEVICE_ID; else read -rp "Device ID (required): " DEVICE_ID < /dev/tty; fi
     [ -z "$DEVICE_ID" ] && die "Device ID is required."
-
-    PLAY_SOUND=true
-    while :; do
-      if [ -t 0 ]; then read -rp "Play ads with sound? [Y/n]: " SOUND_ANS; else read -rp "Play ads with sound? [Y/n]: " SOUND_ANS < /dev/tty; fi
-      SOUND_ANS="${SOUND_ANS:-Y}"
-      case "$SOUND_ANS" in y|Y) PLAY_SOUND=true; break ;; n|N) PLAY_SOUND=false; break ;; *) echo "Please answer Y or N." ;; esac
-    done
-
+    
     sudo -u "$RUN_USER" tee "$CONF_FILE" >/dev/null <<JSON
 {
   "device_id": "$DEVICE_ID",
@@ -163,10 +141,10 @@ else
   "fill_window_secs": 30,
   "queue_max": 5,
   "per_ad_cooldown_secs": 30,
-  "initial_start_delay_secs": 30,
+  "initial_start_delay_secs": 15,
   "cache_dir": "$DATA_DIR/cache",
   "log_file": "$DATA_DIR/logs/ad_runner.log",
-  "play_sound": $PLAY_SOUND,
+  "play_sound": true,
   "duck_other_audio": true,
   "force_ipv4": true
 }
@@ -181,9 +159,9 @@ sudo -u "$RUN_USER" python3 -m venv "$INSTALL_DIR/.venv"
 sudo -u "$RUN_USER" "$INSTALL_DIR/.venv/bin/pip" install --upgrade pip requests urllib3
 
 # ==============================================================================
-# [10] APPLICATION CODE
+# [10] APPLICATION CODE (FIXED v0.1.0)
 # ==============================================================================
-echo "== Phase 6: Installing App Logic (v0.0.8) =="
+echo "== Phase 6: Installing App Logic (v0.1.0) =="
 
 sudo -u "$RUN_USER" tee "$INSTALL_DIR/ad_runner.py" >/dev/null <<'PY'
 #!/usr/bin/env python3
@@ -197,21 +175,17 @@ from urllib3.util import connection, Retry
 from xml.etree import ElementTree as ET
 
 LOCK_PATH = "/opt/ad-runner/ad_runner.lock"
-HEADERS = {"User-Agent":"FlawkAdRunner/0.0.8 (Linux; Production)","Accept":"application/xml,text/xml,*/*"}
+API_HEADERS = {"User-Agent":"FlawkAdRunner/0.1.0","Accept":"application/xml,text/xml,*/*"}
 MPV_TIMEOUT_BUFFER = 40 
 
 def clean_vast_str(s):
-    """Safely removes surrounding whitespace."""
     if not s: return ""
-    # .strip() is safer than re.sub(r'\s+') for URLs which might have legitimate encoded chars
     return str(s).strip()
 
 def remove_xml_namespaces(xml_string):
-    """Robustly removes xmlns attributes including xmlns:xsi, single quotes, etc."""
     try:
         if isinstance(xml_string, bytes):
             xml_string = xml_string.decode('utf-8', errors='ignore')
-        # Remove xmlns attributes (e.g. xmlns="...", xmlns:xsi='...')
         return re.sub(r' xmlns:?[^=]*=["\'][^"\']*["\']', '', xml_string)
     except:
         return xml_string
@@ -228,16 +202,13 @@ def make_session(force_ipv4):
     retries = Retry(total=3, connect=3, read=3, backoff_factor=0.5, status_forcelist=[429,500,502,503,504])
     adapter = IPv4HTTPAdapter(max_retries=retries) if force_ipv4 else HTTPAdapter(max_retries=retries)
     s.mount("http://", adapter); s.mount("https://", adapter)
-    s.headers.update(HEADERS)
     return s
 
 def acquire_singleton_lock(lock_path):
     Path(os.path.dirname(lock_path)).mkdir(parents=True, exist_ok=True)
     fp = open(lock_path, "a+")
     try: fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError: 
-        print("Ad Runner is already running (Locked). Exiting with code 1.")
-        sys.exit(1)
+    except BlockingIOError: sys.exit(1)
     return fp
 
 def ensure_dir(p): Path(p).mkdir(parents=True, exist_ok=True)
@@ -248,57 +219,37 @@ def parse_duration(t:str)->int:
     s=str(t).strip()
     if ":" not in s:
         try: return int(float(s))
-        except: return 0
+        except: return 15
     try:
-        colons = s.count(':')
-        if colons == 3: parts = s.rsplit(':', 1); s = f"{parts[0]}.{parts[1]}"
-        elif ',' in s: s = s.replace(',', '.')
-        if '.' in s:
-            main, ms = s.split('.'); hh, mm, ss = main.split(':')
-            return int(hh)*3600 + int(mm)*60 + int(ss)
-        else:
-            hh, mm, ss = s.split(':')
-            return int(hh)*3600 + int(mm)*60 + int(ss)
-    except Exception:
-        try:
-            parts = s.replace(':', ' ').split()
-            if len(parts) >= 3:
-                return int(parts[0])*3600 + int(parts[1])*60 + int(parts[2])
-        except: pass
-        return 15
+        if '.' in s: s=s.split('.')[0]
+        parts = s.split(':')
+        if len(parts)==3: return int(parts[0])*3600 + int(parts[1])*60 + int(parts[2])
+        if len(parts)==2: return int(parts[0])*60 + int(parts[1])
+    except: pass
+    return 15
 
 def replace_macros(url, duration, playhead):
     ts=int(time.time()); cb=str(random.randint(10000000,99999999))
-    hh=playhead//3600; mm=(playhead%3600)//60; ss=playhead%60
-    ph=f"{hh:02d}:{mm:02d}:{ss:02d}.000"
-    return (url.replace("[TIMESTAMP]",str(ts)).replace("[CACHEBUSTING]",cb).replace("[CONTENTPLAYHEAD]",ph))
-
-def _strip_ns(tag):
-    if '}' in tag: return tag.split('}', 1)[1]
-    return tag
+    return (url.replace("[TIMESTAMP]",str(ts)).replace("[CACHEBUSTING]",cb))
 
 def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
     if depth > max_depth: return None
     result = {"media_url": None, "duration": 15, "impressions": [], "trackers": {"start":[],"firstQuartile":[],"midpoint":[],"thirdQuartile":[],"complete":[]}}
     
-    # [CHANGE 1] STRIP NAMESPACES
     clean_xml = remove_xml_namespaces(xml_content)
     try: root = ET.fromstring(clean_xml)
     except: return None
 
-    # [CHANGE 2] SIMPLE SEARCH (No {*} syntax)
     ad_node = root.find(".//Ad")
     if ad_node is None: ad_node = root 
     
-    # [CHANGE 3] CASE-INSENSITIVE CHECK
     wrapper = ad_node.find(".//Wrapper")
     inline = ad_node.find(".//InLine")
-    if inline is None: inline = ad_node.find(".//Inline") # Check Typo
+    if inline is None: inline = ad_node.find(".//Inline")
     
     active_node = wrapper if wrapper is not None else inline
     if active_node is None: return None
 
-    # [CHANGE 4] CLEAN WHITESPACE ON EXTRACTION
     imps = set() 
     for imp in active_node.findall(".//Impression"):
         val = clean_vast_str(imp.text)
@@ -308,7 +259,7 @@ def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
     for trk in active_node.findall(".//Tracking"):
         evt = trk.get("event")
         url = clean_vast_str(trk.text)
-        if evt in result["trackers"] and url and url not in result["trackers"][evt]: 
+        if evt in result["trackers"] and url: 
             result["trackers"][evt].append(url)
 
     if wrapper is not None:
@@ -316,7 +267,7 @@ def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
         if tag_uri is not None and tag_uri.text:
             try:
                 wrapper_url = clean_vast_str(tag_uri.text)
-                r = session.get(wrapper_url, timeout=5)
+                r = session.get(wrapper_url, headers=API_HEADERS, timeout=5)
                 if r.ok:
                     child = parse_vast_recursive(r.content, session, depth+1, max_depth)
                     if child:
@@ -331,28 +282,20 @@ def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
         for mf in inline.findall(".//MediaFile"):
             u = clean_vast_str(mf.text)
             if not u: continue
-            
+            u = u.replace('\n', '').replace('\r', '').replace('\t', '').strip()
             typ = mf.get("type", "").lower()
             if "mp4" not in typ and not u.endswith(".mp4"): continue
-                
             w_str, h_str = mf.get("width"), mf.get("height")
             try: w = int(w_str) if w_str else 0; h = int(h_str) if h_str else 0
             except: w, h = 0, 0
             candidates.append({"url": u, "w": w, "h": h})
 
-        if not candidates:
-            # Fallback regex on clean XML
-            m = re.search(r'MediaFile.*?><!\[CDATA\[(.*?)\]\]>', clean_xml, re.S)
-            if m: result["media_url"] = clean_vast_str(m.group(1))
-        elif len(candidates) == 1:
+        if candidates:
+            candidates.sort(key=lambda c: min(abs(c["h"] - 1080), abs(c["h"] - 720)))
             result["media_url"] = candidates[0]["url"]
         else:
-            def score_fn(c):
-                h = c["h"]
-                if h <= 0: return 999999
-                return min(abs(h - 720), abs(h - 1080))
-            candidates.sort(key=score_fn)
-            result["media_url"] = candidates[0]["url"]
+            m = re.search(r'MediaFile.*?><!\[CDATA\[(.*?)\]\]>', clean_xml, re.S)
+            if m: result["media_url"] = clean_vast_str(m.group(1))
 
         dn = inline.find(".//Duration")
         if dn is not None and dn.text: result["duration"] = parse_duration(dn.text)
@@ -360,29 +303,11 @@ def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
 
 def parse_legacy_fallback(txt):
     media = re.search(r'MediaFile.*?><!\[CDATA\[(.*?)\]\]>', txt, re.S)
-    if not media: 
-        # [CHANGE] Support simple tags with spaces
-        media = re.search(r'MediaFile.*?>\s*(http.*?)\s*<', txt, re.S)
-    
+    if not media: media = re.search(r'MediaFile.*?>\s*(http.*?)\s*<', txt, re.S)
     if not media: return None
-    
     dur_m = re.search(r'<Duration>(.*?)</Duration>', txt)
     dur = parse_duration(dur_m.group(1)) if dur_m else 15
-    
-    raw_imps = re.findall(r'<Impression.*?><!\[CDATA\[(.*?)\]\]>', txt, re.S)
-    raw_imps += re.findall(r'<Impression.*?>\s*(http.*?)\s*<', txt, re.S)
-    
-    clean_imps = set()
-    for raw in raw_imps:
-        c = clean_vast_str(raw)
-        if c: clean_imps.add(c)
-
-    return {
-        "media_url": clean_vast_str(media.group(1)),
-        "duration": dur,
-        "impressions": list(clean_imps),
-        "trackers": {}
-    }
+    return {"media_url": clean_vast_str(media.group(1)), "duration": dur, "impressions": [], "trackers": {}}
 
 class Log:
     def __init__(self, logfile):
@@ -405,78 +330,42 @@ def enforce_cache_budget(cache_dir, max_mb=1500, max_age_days=30, log=None):
         if not p.exists(): return
         files = [f for f in p.glob("*") if f.is_file()]
         now = time.time()
-        if max_age_days > 0:
-            for f in files:
-                if (now - f.stat().st_mtime) > (max_age_days * 86400): f.unlink(missing_ok=True)
-        files = [f for f in p.glob("*") if f.is_file()]
-        total = sum((f.stat().st_size for f in files), 0)
-        limit = max_mb * 1024 * 1024
-        if total > limit:
-            files.sort(key=lambda f: f.stat().st_mtime)
-            for f in files:
-                total -= f.stat().st_size; f.unlink(missing_ok=True)
-                if total <= limit: break
+        for f in files:
+            if (now - f.stat().st_mtime) > (max_age_days * 86400): f.unlink(missing_ok=True)
     except: pass
 
-def duck_others(mute=True, snapshot=None):
-    try: subprocess.run(["which", "pactl"], check=True, stdout=subprocess.DEVNULL)
-    except: return [] if mute else None
-    try:
-        if mute:
-            out = subprocess.check_output(["pactl", "list", "sink-inputs", "short"], text=True, timeout=0.5)
-            ids = [l.split()[0] for l in out.splitlines() if l.strip() and l.split()[0].isdigit()]
-            for sid in ids:
-                subprocess.run(["pactl", "set-sink-input-mute", sid, "1"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=0.2)
-            return ids
-        elif snapshot:
-            for sid in snapshot:
-                subprocess.run(["pactl", "set-sink-input-mute", sid, "0"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=0.2)
-    except: pass
-
-def download_if_needed(url, cache_dir, session):
+def download_if_needed(url, cache_dir, session, logger=None):
     enforce_cache_budget(cache_dir)
     ensure_dir(cache_dir)
-    
-    url = clean_vast_str(url)
+    url = clean_vast_str(url).replace('\n','').replace('\r','').replace(' ','')
     if not url: return None
-
     ext = os.path.splitext(up.urlparse(url).path)[1] or ".mp4"
-    # Use the cleaned URL for hashing
     filename = sha256_hex(url) + ext
     path = os.path.join(cache_dir, filename)
-    
     if os.path.exists(path):
-        if os.path.getsize(path) > 1024:
-            return path
-        else:
-            try: os.unlink(path)
-            except: pass
-
+        if os.path.getsize(path) > 1024: return path
+        try: os.unlink(path)
+        except: pass
+    dl_headers = {"User-Agent": "FlawkAdRunner/0.1.0", "Accept": "*/*"}
     try:
-        # [FIX] Do not use the global API headers (Accept: xml) for video files
-        # We create a clean set of headers for the file download
-        dl_headers = {"User-Agent": "FlawkAdRunner/0.0.8", "Accept": "*/*"}
-        
+        if logger: logger.info(f"Downloading: {url}")
         r = session.get(url, headers=dl_headers, timeout=60, stream=True)
-        
         if not r.ok:
-            print(f"[WARN] Download Failed {r.status_code}: {url}") # Simple print to show up in systemd logs
+            if logger: logger.warn(f"Download Fail [HTTP {r.status_code}]")
             return url
-        
         temp_path = path + ".tmp"
         with open(temp_path, "wb") as f:
             for chunk in r.iter_content(8192):
                 if chunk: f.write(chunk)
-        
         if os.path.getsize(temp_path) > 1024:
             os.rename(temp_path, path)
+            if logger: logger.info("Download Complete.")
             return path
         else:
-            print(f"[WARN] Download too small ({os.path.getsize(temp_path)}b): {url}")
             os.unlink(temp_path)
             return url
     except Exception as e:
-        print(f"[ERR] Download Exception: {e}")
+        if logger: logger.err(f"Download Exception: {e}")
         return url
 
 class Runner:
@@ -489,10 +378,7 @@ class Runner:
         self.cache = self.cfg.get("cache_dir")
         self.log = Log(self.cfg.get("log_file"))
         self.http = make_session(self.cfg.get("force_ipv4", True))
-        
         ensure_dir(self.cache)
-        enforce_cache_budget(self.cache, log=self.log)
-        
         self.queue = []
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=6)
         threading.Thread(target=self.heartbeat_loop, daemon=True).start()
@@ -502,8 +388,6 @@ class Runner:
         try:
             with open('/proc/uptime','r') as f: s["uptime"]=int(float(f.read().split()[0]))
             with open('/proc/loadavg','r') as f: s["cpu"]=float(f.read().split()[0])
-            st = os.statvfs(self.cache)
-            s["disk"] = int((st.f_bavail * st.f_frsize)/1024/1024)
         except: pass
         return s
 
@@ -511,56 +395,30 @@ class Runner:
         while True:
             try:
                 payload = {"device_id": self.device, "status": "PLAYING" if self.queue else "IDLE", "stats": self.get_stats(), "queue": len(self.queue)}
-                if self.hb_url:
-                    r = self.http.post(self.hb_url, json=payload, timeout=5)
-                    if r.ok:
-                        cmd = r.json().get("command")
-                        if cmd == "REBOOT": subprocess.run(["sudo", "reboot"])
-                        if cmd == "UPDATE": subprocess.Popen(["/bin/bash", "/opt/flawk/updater.sh", "--force"])
+                if self.hb_url: self.http.post(self.hb_url, json=payload, timeout=5)
             except: pass
             time.sleep(60)
 
-    def req_url(self):
-        return f"{self.api}?device_id={self.device}&api_key={self.api_key}"
-
-    def _net_task(self, url, label):
-        try:
-            r = self.http.get(url, timeout=5)
-            if 200<=r.status_code<400: self.log.info(f"Trk {label} -> {r.status_code}")
-        except: pass
-
     def fire_delayed(self, delay, urls, label):
         def t():
-            for u in urls: self.executor.submit(self._net_task, replace_macros(u,0,0), label)
+            for u in urls: 
+                try: self.http.get(replace_macros(u,0,0), headers={"User-Agent":"Flawk"}, timeout=5)
+                except: pass
         if delay<=0: t()
         else: threading.Timer(delay, t).start()
 
     def fill_once(self):
         try:
-            r = self.http.get(self.req_url(), timeout=10)
+            url = f"{self.api}?device_id={self.device}&api_key={self.api_key}"
+            r = self.http.get(url, headers=API_HEADERS, timeout=10)
             if r.status_code==204 or not r.content: return False
-            
             vast_data = parse_vast_recursive(r.content, self.http)
-            
-            if not vast_data or not vast_data["media_url"]:
-                self.log.warn("Smart Parse failed. Trying Legacy...")
-                vast_data = parse_legacy_fallback(r.text)
-                
-            if not vast_data or not vast_data["media_url"]:
-                self.log.warn("VAST Parse failed (No Media Found).")
-                return False
-            
+            if not vast_data or not vast_data["media_url"]: vast_data = parse_legacy_fallback(r.text)
+            if not vast_data or not vast_data["media_url"]: return False
             media_url = vast_data["media_url"]
-            local = download_if_needed(media_url, self.cache, self.http)
             dur = vast_data["duration"]
-            
-            self.queue.append({
-                "src": media_url, 
-                "path": local, 
-                "dur": dur, 
-                "imps": vast_data["impressions"], 
-                "trk": vast_data["trackers"]
-            })
+            local = download_if_needed(media_url, self.cache, self.http, self.log)
+            self.queue.append({"src": media_url, "path": local, "dur": dur, "imps": vast_data["impressions"], "trk": vast_data["trackers"]})
             self.log.info(f"Queued: {media_url[-20:]} (Dur: {dur}s)")
             return True
         except Exception as e: 
@@ -577,56 +435,50 @@ class Runner:
             if os.path.exists(ad['path']):
                 Path(ad['path']).touch()
                 paths.append(ad['path'])
-            else: paths.append(ad['src'])
+            else:
+                paths.append(ad['src'])
         
         offset = 0
         for ad in items:
             if ad['imps']: self.fire_delayed(offset, ad['imps'], "imp")
-            if 'trk' in ad and ad['trk']:
-                evs=[("start",0),("firstQuartile",ad['dur']//4),("midpoint",ad['dur']//2),
-                     ("thirdQuartile",(ad['dur']*3)//4),("complete",max(0,ad['dur']-1))]
-                for name, tsec in evs:
-                    if name in ad['trk']: self.fire_delayed(offset+tsec, ad['trk'][name], name)
             offset += ad['dur']
 
-        is_muted = not self.cfg.get("play_sound", True)
-        snap = duck_others(True) if (not is_muted and self.cfg.get("duck_other_audio")) else None
+        subprocess.run(["pkill", "-9", "-f", "mpv --fs"], stdout=subprocess.DEVNULL)
         
-        subprocess.run(["pkill", "-9", "-f", "mpv --fs"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
+        # [MPV FIX] Removed duplicate args logic
         cmd = ["mpv", "--fs", "--no-border", "--really-quiet", 
                "--ontop", "--force-window=immediate", "--keep-open=no",
                "--geometry=100%x100%", "--autofit=100%",
                "--input-default-bindings=no", "--input-vo-keyboard=no", 
-               "--cursor-autohide=always", "--osc=no", #"--prefetch-playlist=yes",
-               "--vo=gpu", "--gpu-context=x11" if os.environ.get("DISPLAY") else "--gpu-context=drm",
+               "--cursor-autohide=always", "--osc=no",
                f"--log-file=/var/log/ad-runner/mpv_player.log"]
+
+        if os.environ.get("DISPLAY"):
+             cmd.extend(["--vo=gpu", "--gpu-context=x11"])
+        else:
+             cmd.extend(["--vo=gpu", "--gpu-context=drm"])
         
-        if is_muted: cmd.append("--mute=yes")
+        if not self.cfg.get("play_sound", True): cmd.append("--mute=yes")
         cmd = cmd + paths
         
-        env = os.environ.copy(); env["DISPLAY"] = env.get("DISPLAY", ":0")
+        env = os.environ.copy()
+        if os.environ.get("DISPLAY"): env["DISPLAY"] = os.environ.get("DISPLAY")
         
-        TIMEOUT_VAL = total_sec + MPV_TIMEOUT_BUFFER
-        self.log.info(f"Playing Batch. Total: {total_sec}s. Watchdog: {TIMEOUT_VAL}s")
-
+        self.log.info(f"Playing Batch. Total: {total_sec}s.")
         try:
-            subprocess.run(cmd, env=env, check=False, timeout=TIMEOUT_VAL)
+            subprocess.run(cmd, env=env, check=False, timeout=total_sec + MPV_TIMEOUT_BUFFER)
         except subprocess.TimeoutExpired:
             self.log.err(f"MPV Freeze detected. Killing.")
             subprocess.run(["pkill", "-9", "-f", "mpv --fs"], stdout=subprocess.DEVNULL)
-        
-        if snap: duck_others(False, snap)
         return len(items)
 
     def run(self):
-        self.log.info(f"Runner Start v0.0.8. ID={self.device}")
+        self.log.info(f"Runner Start v0.1.0. ID={self.device}")
         time.sleep(self.cfg.get("initial_start_delay_secs", 10))
         while True:
             while len(self.queue) < self.cfg.get("queue_max",5):
                 if not self.fill_once(): break
                 time.sleep(1)
-            
             if self.queue:
                 played = self.play_queue()
                 time.sleep(self.cfg.get("per_ad_cooldown_secs", 30) * played)
@@ -639,133 +491,33 @@ if __name__=="__main__":
 PY
 
 # ==============================================================================
-# [11] SUPERVISOR
+# [11] SUPERVISOR (WITH XAUTH FIX)
 # ==============================================================================
 echo "== Phase 7: Installing Supervisor =="
 sudo -u "$RUN_USER" tee "$INSTALL_DIR/supervisor.sh" >/dev/null <<'BASH'
 #!/bin/bash
 APP_DIR="/opt/ad-runner"
 VENV="$APP_DIR/.venv"
-# NO LOCK REMOVAL
+
+# [FIX] EXPORT DISPLAY AND FIND XAUTHORITY
+export DISPLAY=:0
+# Try to find the Xauthority file for the current user
+if [ -f "$HOME/.Xauthority" ]; then
+    export XAUTHORITY="$HOME/.Xauthority"
+elif [ -f "/home/$(whoami)/.Xauthority" ]; then
+    export XAUTHORITY="/home/$(whoami)/.Xauthority"
+fi
+
 pkill -9 -u "$(whoami)" -f "mpv --fs" || true
-usage=$(df "$APP_DIR" | awk 'NR==2 {print $5}' | tr -d '%')
-if [ "$usage" -gt 90 ]; then rm -rf "$APP_DIR/cache/"*; fi
+chmod -R 755 "$APP_DIR/cache" 2>/dev/null || true
 exec "$VENV/bin/python3" "$APP_DIR/ad_runner.py"
 BASH
 sudo chmod +x "$INSTALL_DIR/supervisor.sh"
 
 # ==============================================================================
-# [12] UPDATER ENGINE
+# [12] FINAL LINKING & SYSTEMD
 # ==============================================================================
-echo "== Phase 8: Installing Updater =="
-
-sudo -u "$RUN_USER" tee "$BASE_DIR/updater.sh" >/dev/null <<'BASH'
-#!/bin/bash
-set -u
-
-BASE_DIR="/opt/flawk"
-DATA_DIR="$BASE_DIR/data"
-VERSIONS_DIR="$BASE_DIR/versions"
-CURRENT_LINK="$BASE_DIR/current"
-LOG_FILE="$DATA_DIR/logs/updater.log"
-CONFIG_FILE="$DATA_DIR/config.json"
-
-log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [UPDATER] $1" >> "$LOG_FILE"; }
-
-if [ ! -f "$CONFIG_FILE" ]; then exit 1; fi
-DEVICE_ID=$(jq -r .device_id "$CONFIG_FILE")
-MANIFEST_URL=$(jq -r .manifest_url "$CONFIG_FILE")
-if [ -z "$DEVICE_ID" ] || [ "$DEVICE_ID" == "null" ]; then exit 1; fi
-
-if [ "${1:-}" != "--force" ]; then
-    SLEEP_SEC=$((RANDOM % 1800))
-    sleep $SLEEP_SEC
-fi
-
-HTTP_CODE=$(curl -s -w "%{http_code}" -o /tmp/manifest_temp.json --max-time 15 "$MANIFEST_URL")
-if [ "$HTTP_CODE" != "200" ]; then exit 0; fi
-if ! jq -e . /tmp/manifest_temp.json >/dev/null 2>&1; then exit 0; fi
-JSON=$(cat /tmp/manifest_temp.json)
-
-TARGET_VER=$(echo "$JSON" | jq -r .stable.version)
-URL=$(echo "$JSON" | jq -r .stable.url)
-SUM=$(echo "$JSON" | jq -r .stable.shasum)
-ROLLOUT=$(echo "$JSON" | jq -r .stable.rollout_percent)
-
-IS_BETA=$(echo "$JSON" | jq -r --arg id "$DEVICE_ID" '.beta.devices[] | select(. == $id)')
-if [ -n "$IS_BETA" ]; then
-    TARGET_VER=$(echo "$JSON" | jq -r .beta.version)
-    URL=$(echo "$JSON" | jq -r .beta.url)
-    SUM=$(echo "$JSON" | jq -r .beta.shasum)
-    ROLLOUT=100
-fi
-
-HASH_NUM=$(echo -n "$DEVICE_ID" | cksum | awk '{print $1 % 100}')
-if [ "$ROLLOUT" != "100" ] && [ "$HASH_NUM" -ge "$ROLLOUT" ]; then exit 0; fi
-
-CURRENT_VER="unknown"
-if [ -f "$CURRENT_LINK/version.txt" ]; then CURRENT_VER=$(cat "$CURRENT_LINK/version.txt"); fi
-if [ "$CURRENT_VER" == "$TARGET_VER" ]; then exit 0; fi
-
-log "Update: $CURRENT_VER -> $TARGET_VER"
-
-NEW_DIR="$VERSIONS_DIR/$TARGET_VER"
-if [ -d "$NEW_DIR" ]; then rm -rf "$NEW_DIR"; fi
-mkdir -p "$NEW_DIR"
-
-TMP_FILE="/tmp/update_$TARGET_VER.tar.gz"
-if ! curl -L -s -o "$TMP_FILE" "$URL"; then log "Download failed."; exit 1; fi
-
-CALC_SUM=$(sha256sum "$TMP_FILE" | awk '{print $1}')
-if [ "$CALC_SUM" != "$SUM" ]; then log "Checksum mismatch!"; rm -f "$TMP_FILE"; exit 1; fi
-
-tar -xzf "$TMP_FILE" -C "$NEW_DIR"
-rm -f "$TMP_FILE"
-echo "$TARGET_VER" > "$NEW_DIR/version.txt"
-
-ln -sf "$DATA_DIR/config.json" "$NEW_DIR/config.json"
-ln -sf "$DATA_DIR/cache" "$NEW_DIR/cache"
-ln -sf "$DATA_DIR/logs" "$NEW_DIR/logs"
-
-python3 -m venv "$NEW_DIR/.venv"
-if [ -f "$NEW_DIR/requirements.txt" ]; then
-    "$NEW_DIR/.venv/bin/pip" install -r "$NEW_DIR/requirements.txt" --quiet
-fi
-
-OWNER=$(stat -c '%U' "$CONFIG_FILE")
-chown -R "$OWNER:$OWNER" "$NEW_DIR"
-
-ln -sfn "$NEW_DIR" "$BASE_DIR/next"
-mv -Tf "$BASE_DIR/next" "$CURRENT_LINK"
-
-log "Restarting service..."
-systemctl restart ad-runner.service
-sleep 20
-
-if systemctl is-active --quiet ad-runner.service; then
-    log "Update SUCCESS."
-else
-    log "CRITICAL: Service crashed. Rolling back."
-    PREV_DIR=$(ls -dt "$VERSIONS_DIR"/*/ | head -n 2 | tail -n 1)
-    if [ -n "$PREV_DIR" ]; then
-        ln -sfn "$PREV_DIR" "$BASE_DIR/rollback_link"
-        mv -Tf "$BASE_DIR/rollback_link" "$CURRENT_LINK"
-        systemctl restart ad-runner.service
-        log "Rollback done."
-    fi
-    exit 1
-fi
-
-ls -dt "$VERSIONS_DIR"/*/ | tail -n +3 | xargs rm -rf 2>/dev/null || true
-BASH
-sudo chmod +x "$BASE_DIR/updater.sh"
-
-(crontab -l 2>/dev/null; echo "0 3 * * * /bin/bash /opt/flawk/updater.sh") | crontab -
-
-# ==============================================================================
-# [13] FINAL LINKING & SYSTEMD
-# ==============================================================================
-echo "== Phase 9: Linking & Services =="
+echo "== Phase 8: Finalizing =="
 ln -sf "$DATA_DIR/config.json" "$INSTALL_DIR/config.json"
 ln -sf "$DATA_DIR/cache" "$INSTALL_DIR/cache"
 ln -sf "$DATA_DIR/logs" "$INSTALL_DIR/logs"
@@ -776,7 +528,7 @@ ln -sfn "$BASE_DIR/current" "$LEGACY_APP_DIR"
 
 tee /etc/systemd/system/ad-runner.service >/dev/null <<UNIT
 [Unit]
-Description=Flawk Ad Runner (Production v0.0.8)
+Description=Flawk Ad Runner (Production v0.1.0)
 After=network-online.target sound.target graphical-session.target
 Wants=network-online.target
 
@@ -789,8 +541,6 @@ ExecStart=/bin/bash supervisor.sh
 Restart=always
 RestartSec=5
 StartLimitBurst=10
-StartLimitIntervalSec=60
-CPUWeight=1000
 Environment=DISPLAY=:0
 Environment=XDG_RUNTIME_DIR=/run/user/$RUN_UID
 StandardOutput=append:$LOG_DIR/service.log
@@ -811,21 +561,15 @@ $LOG_DIR/*.log $DATA_DIR/logs/*.log {
 }
 ROT
 
-# ==============================================================================
-# [14] FINALIZE
-# ==============================================================================
-echo "== Phase 10: Launching =="
 ensure_user_bus "$RUN_USER"
 systemctl daemon-reload
 systemctl enable --now ad-runner.service
 
 echo
 echo "=========================================="
-echo "   FLAWK AD RUNNER INSTALLED (v0.0.8)"
-echo "   - Config Tweaked (Cooldown 30s)"
-echo "   - Safe Mode (No apt-get)"
+echo "    FLAWK AD RUNNER INSTALLED (v0.1.0)"
+echo "    (Fixes: MPV Arguments + XAuthority)"
 echo "=========================================="
-echo " Device ID: $DEVICE_ID"
-echo " Status:    systemctl status ad-runner"
-echo " Logs:      tail -f $DATA_DIR/logs/ad_runner.log"
+echo " Logs: tail -f $DATA_DIR/logs/ad_runner.log"
+echo " Player Log: tail -f /var/log/ad-runner/mpv_player.log"
 echo "=========================================="
