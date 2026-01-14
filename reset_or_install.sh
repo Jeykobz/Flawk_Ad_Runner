@@ -556,13 +556,13 @@ class Runner:
         mpv_log = os.path.join(log_dir, "mpv_playback.log")
 
         # MPV COMMAND - Auto Context & Logging
-        cmd = ["mpv", "--fs", "--no-border", 
-               f"--log-file={mpv_log}", "--msg-level=all=warn,vo=debug",
+        cmd = ["mpv", "--fs", "--no-border", "--really-quiet", 
                "--ontop", "--force-window=immediate", "--keep-open=no",
                "--geometry=100%x100%", "--autofit=100%",
                "--input-default-bindings=no", "--input-vo-keyboard=no", 
-               "--cursor-autohide=always", "--osc=no", 
-               "--vo=gpu", "--gpu-context=auto"] # CHANGED: Auto context
+               "--cursor-autohide=always", "--osc=no", #"--prefetch-playlist=yes",
+               "--vo=gpu", "--gpu-context=x11" if os.environ.get("DISPLAY") else "--gpu-context=drm",
+               f"--log-file=/var/log/ad-runner/mpv_player.log"]
 
         if is_muted: cmd.append("--mute=yes")
         cmd = cmd + paths
