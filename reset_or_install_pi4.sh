@@ -183,7 +183,7 @@ sudo -u "$RUN_USER" "$INSTALL_DIR/.venv/bin/pip" install --upgrade pip requests 
 # ==============================================================================
 # [10] APPLICATION CODE
 # ==============================================================================
-echo "== Phase 6: Installing App Logic (v0.0.8) =="
+echo "== Phase 6: Installing App Logic (v0.0.9 - Debug & Auto-Context) =="
 
 sudo -u "$RUN_USER" tee "$INSTALL_DIR/ad_runner.py" >/dev/null <<'PY'
 #!/usr/bin/env python3
@@ -191,14 +191,30 @@ import os, sys, time, json, random, hashlib, threading, subprocess, logging, log
 import concurrent.futures
 import urllib.parse as up
 from pathlib import Path
+from xml.etree import ElementTree as ET
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import connection, Retry
-from xml.etree import ElementTree as ET
 
 LOCK_PATH = "/opt/ad-runner/ad_runner.lock"
-HEADERS = {"User-Agent":"FlawkAdRunner/0.0.8 (Linux; Production)","Accept":"application/xml,text/xml,*/*"}
+HEADERS = {"User-Agent":"FlawkAdRunner/0.0.9 (Linux; Production)","Accept":"application/xml,text/xml,*/*"}
 MPV_TIMEOUT_BUFFER = 40 
+
+# --- HELPER: Aggressive String Cleaner ---
+def clean_vast_str(s):
+    """Aggressively removes all whitespace (spaces, tabs, newlines) from a URL string."""
+    if not s: return ""
+    return re.sub(r'\s+', '', str(s))
+
+# --- HELPER: Strip XML Namespaces ---
+def remove_xml_namespaces(xml_string):
+    """Removes xmlns attributes to flatten the XML for easier parsing."""
+    try:
+        if isinstance(xml_string, bytes):
+            xml_string = xml_string.decode('utf-8', errors='ignore')
+        return re.sub(r' xmlns="[^"]+"', '', xml_string, count=0)
+    except:
+        return xml_string
 
 class IPv4HTTPAdapter(HTTPAdapter):
     def init_poolmanager(self, *args, **kwargs):
@@ -234,22 +250,12 @@ def parse_duration(t:str)->int:
         try: return int(float(s))
         except: return 0
     try:
-        colons = s.count(':')
-        if colons == 3: parts = s.rsplit(':', 1); s = f"{parts[0]}.{parts[1]}"
-        elif ',' in s: s = s.replace(',', '.')
-        if '.' in s:
-            main, ms = s.split('.'); hh, mm, ss = main.split(':')
-            return int(hh)*3600 + int(mm)*60 + int(ss)
-        else:
-            hh, mm, ss = s.split(':')
-            return int(hh)*3600 + int(mm)*60 + int(ss)
-    except Exception:
-        try:
-            parts = s.replace(':', ' ').split()
-            if len(parts) >= 3:
-                return int(parts[0])*3600 + int(parts[1])*60 + int(parts[2])
-        except: pass
-        return 15
+        if '.' in s: s = s.split('.')[0]
+        parts = s.split(':')
+        if len(parts) == 3: return int(parts[0])*3600 + int(parts[1])*60 + int(parts[2])
+        if len(parts) == 2: return int(parts[0])*60 + int(parts[1])
+    except: pass
+    return 15
 
 def replace_macros(url, duration, playhead):
     ts=int(time.time()); cb=str(random.randint(10000000,99999999))
@@ -261,45 +267,47 @@ def _strip_ns(tag):
     if '}' in tag: return tag.split('}', 1)[1]
     return tag
 
-# --- SMART PARSER (Media Selection + Recursion) ---
 def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
     if depth > max_depth: return None
     result = {"media_url": None, "duration": 15, "impressions": [], "trackers": {"start":[],"firstQuartile":[],"midpoint":[],"thirdQuartile":[],"complete":[]}}
-    try: root = ET.fromstring(xml_content)
+    
+    # 1. Clean XML String (Fixes Namespace issues)
+    clean_xml = remove_xml_namespaces(xml_content)
+    try: root = ET.fromstring(clean_xml)
     except: return None
 
-    ad_node = None
-    if _strip_ns(root.tag).upper() == "VAST":
-        ad_node = root.find(".//{*}Ad")
-        if ad_node is None: ad_node = root.find("Ad")
-    else: ad_node = root
-    if ad_node is None: return None
-
-    wrapper = ad_node.find(".//{*}Wrapper"); inline = ad_node.find(".//{*}Inline")
-    if wrapper is None: wrapper = ad_node.find("Wrapper")
-    if inline is None: inline = ad_node.find("Inline")
+    # 2. Simple Find (No Namespaces, Flat Search)
+    ad_node = root.find(".//Ad")
+    if ad_node is None: ad_node = root 
+    
+    wrapper = ad_node.find(".//Wrapper")
+    # Check casing for both InLine (Standard) and Inline (Typo)
+    inline = ad_node.find(".//InLine")
+    if inline is None: inline = ad_node.find(".//Inline")
+    
     active_node = wrapper if wrapper is not None else inline
     if active_node is None: return None
 
+    # 3. Clean Impressions (Fixes 404s)
     imps = set() 
-    for imp in active_node.findall(".//{*}Impression"):
-        if imp.text and imp.text.strip(): imps.add(imp.text.strip())
-    for imp in active_node.findall("Impression"):
-        if imp.text and imp.text.strip(): imps.add(imp.text.strip())
+    for imp in active_node.findall(".//Impression"):
+        val = clean_vast_str(imp.text)
+        if val: imps.add(val)
     result["impressions"] = list(imps)
 
-    for trk in active_node.findall(".//{*}Tracking"):
+    # 4. Clean Trackers
+    for trk in active_node.findall(".//Tracking"):
         evt = trk.get("event")
-        url = trk.text.strip() if trk.text else ""
+        url = clean_vast_str(trk.text)
         if evt in result["trackers"] and url and url not in result["trackers"][evt]: 
             result["trackers"][evt].append(url)
 
     if wrapper is not None:
-        tag_uri = wrapper.find(".//{*}VASTAdTagURI")
-        if tag_uri is None: tag_uri = wrapper.find("VASTAdTagURI")
+        tag_uri = wrapper.find(".//VASTAdTagURI")
         if tag_uri is not None and tag_uri.text:
             try:
-                r = session.get(tag_uri.text.strip(), timeout=5)
+                wrapper_url = clean_vast_str(tag_uri.text)
+                r = session.get(wrapper_url, timeout=5)
                 if r.ok:
                     child = parse_vast_recursive(r.content, session, depth+1, max_depth)
                     if child:
@@ -311,8 +319,8 @@ def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
             except: pass
     elif inline is not None:
         candidates = []
-        for mf in inline.findall(".//{*}MediaFile"):
-            u = mf.text.strip() if mf.text else ""
+        for mf in inline.findall(".//MediaFile"):
+            u = clean_vast_str(mf.text)
             if not u: continue
             
             typ = mf.get("type", "").lower()
@@ -324,8 +332,9 @@ def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
             candidates.append({"url": u, "w": w, "h": h})
 
         if not candidates:
-            m = re.search(r'MediaFile.*?><!\[CDATA\[(.*?)\]\]>', xml_content.decode('utf-8', 'ignore'), re.S)
-            if m: result["media_url"] = m.group(1).strip()
+            # Fallback Regex within Smart Parser
+            m = re.search(r'MediaFile.*?><!\[CDATA\[(.*?)\]\]>', clean_xml, re.S)
+            if m: result["media_url"] = clean_vast_str(m.group(1))
         elif len(candidates) == 1:
             result["media_url"] = candidates[0]["url"]
         else:
@@ -336,20 +345,35 @@ def parse_vast_recursive(xml_content, session, depth=0, max_depth=5):
             candidates.sort(key=score_fn)
             result["media_url"] = candidates[0]["url"]
 
-        dn = inline.find(".//{*}Duration")
+        dn = inline.find(".//Duration")
         if dn is not None and dn.text: result["duration"] = parse_duration(dn.text)
     return result
 
 def parse_legacy_fallback(txt):
+    # CDATA Regex
     media = re.search(r'MediaFile.*?><!\[CDATA\[(.*?)\]\]>', txt, re.S)
-    if not media: media = re.search(r'MediaFile.*?>(http.*?)<', txt, re.S)
+    if not media: 
+        # Simple Tag Regex (Handles attributes and whitespace)
+        media = re.search(r'MediaFile.*?>\s*(http.*?)\s*<', txt, re.S)
+    
     if not media: return None
+    
     dur_m = re.search(r'<Duration>(.*?)</Duration>', txt)
     dur = parse_duration(dur_m.group(1)) if dur_m else 15
+    
+    # Impressions (CDATA + Simple)
+    raw_imps = re.findall(r'<Impression.*?><!\[CDATA\[(.*?)\]\]>', txt, re.S)
+    raw_imps += re.findall(r'<Impression.*?>\s*(http.*?)\s*<', txt, re.S)
+    
+    clean_imps = set()
+    for raw in raw_imps:
+        c = clean_vast_str(raw)
+        if c: clean_imps.add(c)
+
     return {
-        "media_url": media.group(1).strip(),
+        "media_url": clean_vast_str(media.group(1)),
         "duration": dur,
-        "impressions": list(set(re.findall(r'<Impression.*?><!\[CDATA\[(.*?)\]\]>', txt, re.S))),
+        "impressions": list(clean_imps),
         "trackers": {}
     }
 
@@ -368,15 +392,10 @@ class Log:
     def warn(self,*a): self.l.warning(" ".join(map(str,a)))
     def err (self,*a): self.l.error(" ".join(map(str,a)))
 
-def enforce_cache_budget(cache_dir, max_mb=1500, max_age_days=30, log=None):
+def enforce_cache_budget(cache_dir, max_mb=1500):
     try:
         p = Path(cache_dir)
         if not p.exists(): return
-        files = [f for f in p.glob("*") if f.is_file()]
-        now = time.time()
-        if max_age_days > 0:
-            for f in files:
-                if (now - f.stat().st_mtime) > (max_age_days * 86400): f.unlink(missing_ok=True)
         files = [f for f in p.glob("*") if f.is_file()]
         total = sum((f.stat().st_size for f in files), 0)
         limit = max_mb * 1024 * 1024
@@ -405,16 +424,38 @@ def duck_others(mute=True, snapshot=None):
 def download_if_needed(url, cache_dir, session):
     enforce_cache_budget(cache_dir)
     ensure_dir(cache_dir)
+    
+    # 1. Clean URL (Fixes Random Hashes)
+    url = clean_vast_str(url)
+    
     ext = os.path.splitext(up.urlparse(url).path)[1] or ".mp4"
     path = os.path.join(cache_dir, sha256_hex(url)+ext)
-    if os.path.exists(path) and os.path.getsize(path)>0: return path
+    
+    # 2. Check Exists & Size
+    if os.path.exists(path):
+        if os.path.getsize(path) > 1024:
+            return path
+        else:
+            try: os.unlink(path) # Delete corrupt 0-byte file
+            except: pass
+
     try:
         r = session.get(url, timeout=60, stream=True)
         if not r.ok: return url
-        with open(path,"wb") as f:
+        
+        # 3. Atomic Write (Prevents half-downloads)
+        temp_path = path + ".tmp"
+        with open(temp_path, "wb") as f:
             for chunk in r.iter_content(8192):
                 if chunk: f.write(chunk)
-        return path
+        
+        # 4. Verify & Rename
+        if os.path.getsize(temp_path) > 1024:
+            os.rename(temp_path, path)
+            return path
+        else:
+            os.unlink(temp_path)
+            return url
     except: return url
 
 class Runner:
@@ -429,26 +470,16 @@ class Runner:
         self.http = make_session(self.cfg.get("force_ipv4", True))
         
         ensure_dir(self.cache)
-        enforce_cache_budget(self.cache, log=self.log)
+        enforce_cache_budget(self.cache)
         
         self.queue = []
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=6)
         threading.Thread(target=self.heartbeat_loop, daemon=True).start()
 
-    def get_stats(self):
-        s = {"uptime":0,"cpu":0,"disk":0}
-        try:
-            with open('/proc/uptime','r') as f: s["uptime"]=int(float(f.read().split()[0]))
-            with open('/proc/loadavg','r') as f: s["cpu"]=float(f.read().split()[0])
-            st = os.statvfs(self.cache)
-            s["disk"] = int((st.f_bavail * st.f_frsize)/1024/1024)
-        except: pass
-        return s
-
     def heartbeat_loop(self):
         while True:
             try:
-                payload = {"device_id": self.device, "status": "PLAYING" if self.queue else "IDLE", "stats": self.get_stats(), "queue": len(self.queue)}
+                payload = {"device_id": self.device, "status": "PLAYING" if self.queue else "IDLE", "queue": len(self.queue)}
                 if self.hb_url:
                     r = self.http.post(self.hb_url, json=payload, timeout=5)
                     if r.ok:
@@ -458,14 +489,22 @@ class Runner:
             except: pass
             time.sleep(60)
 
-    def req_url(self):
-        return f"{self.api}?device_id={self.device}&api_key={self.api_key}"
+    def req_url(self): return f"{self.api}?device_id={self.device}&api_key={self.api_key}"
 
     def _net_task(self, url, label):
         try:
-            r = self.http.get(url, timeout=5)
-            if 200<=r.status_code<400: self.log.info(f"Trk {label} -> {r.status_code}")
-        except: pass
+            # Added a user-agent specifically for tracking to avoid bot blocks
+            headers = {"User-Agent": "FlawkAdRunner/0.0.29"} 
+            r = self.http.get(url, headers=headers, timeout=5)
+            
+            if 200 <= r.status_code < 300:
+                self.log.info(f"Trk {label} -> {r.status_code}")
+            else:
+                # NOW LOGS ERRORS
+                self.log.warn(f"Trk {label} FAILED -> {r.status_code} ({url})")
+        except Exception as e:
+            # NOW LOGS EXCEPTIONS
+            self.log.err(f"Trk {label} ERROR -> {e} ({url})")
 
     def fire_delayed(self, delay, urls, label):
         def t():
@@ -477,29 +516,13 @@ class Runner:
         try:
             r = self.http.get(self.req_url(), timeout=10)
             if r.status_code==204 or not r.content: return False
+            vast = parse_vast_recursive(r.content, self.http)
+            if not vast or not vast["media_url"]: vast = parse_legacy_fallback(r.text)
+            if not vast or not vast["media_url"]: return False
             
-            vast_data = parse_vast_recursive(r.content, self.http)
-            
-            if not vast_data or not vast_data["media_url"]:
-                self.log.warn("Smart Parse failed. Trying Legacy...")
-                vast_data = parse_legacy_fallback(r.text)
-                
-            if not vast_data or not vast_data["media_url"]:
-                self.log.warn("VAST Parse failed (No Media Found).")
-                return False
-            
-            media_url = vast_data["media_url"]
-            local = download_if_needed(media_url, self.cache, self.http)
-            dur = vast_data["duration"]
-            
-            self.queue.append({
-                "src": media_url, 
-                "path": local, 
-                "dur": dur, 
-                "imps": vast_data["impressions"], 
-                "trk": vast_data["trackers"]
-            })
-            self.log.info(f"Queued: {media_url[-20:]} (Dur: {dur}s)")
+            local = download_if_needed(vast["media_url"], self.cache, self.http)
+            self.queue.append({"src": vast["media_url"], "path": local, "dur": vast["duration"], "imps": vast["impressions"], "trk": vast["trackers"]})
+            self.log.info(f"Queued: {vast['media_url'][-20:]}")
             return True
         except Exception as e: 
             self.log.err(f"Fill Error: {e}")
@@ -512,18 +535,14 @@ class Runner:
         total_sec = 0
         for ad in items:
             total_sec += ad['dur']
-            if os.path.exists(ad['path']):
-                Path(ad['path']).touch()
-                paths.append(ad['path'])
-            else: paths.append(ad['src'])
+            paths.append(ad['path'] if os.path.exists(ad['path']) else ad['src'])
+            if os.path.exists(ad['path']): Path(ad['path']).touch()
         
         offset = 0
         for ad in items:
             if ad['imps']: self.fire_delayed(offset, ad['imps'], "imp")
             if 'trk' in ad and ad['trk']:
-                evs=[("start",0),("firstQuartile",ad['dur']//4),("midpoint",ad['dur']//2),
-                     ("thirdQuartile",(ad['dur']*3)//4),("complete",max(0,ad['dur']-1))]
-                for name, tsec in evs:
+                for name, tsec in [("start",0),("firstQuartile",ad['dur']//4),("midpoint",ad['dur']//2),("thirdQuartile",(ad['dur']*3)//4),("complete",max(0,ad['dur']-1))]:
                     if name in ad['trk']: self.fire_delayed(offset+tsec, ad['trk'][name], name)
             offset += ad['dur']
 
@@ -532,38 +551,47 @@ class Runner:
         
         subprocess.run(["pkill", "-9", "-f", "mpv --fs"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
+        # LOGGING SETUP - Save to same dir as main log
+        log_dir = os.path.dirname(self.cfg.get("log_file"))
+        mpv_log = os.path.join(log_dir, "mpv_playback.log")
+
+        # MPV COMMAND - Auto Context & Logging
         cmd = ["mpv", "--fs", "--no-border", "--really-quiet", 
                "--ontop", "--force-window=immediate", "--keep-open=no",
                "--geometry=100%x100%", "--autofit=100%",
                "--input-default-bindings=no", "--input-vo-keyboard=no", 
                "--cursor-autohide=always", "--osc=no", #"--prefetch-playlist=yes",
-               "--vo=gpu", "--gpu-context=x11" if os.environ.get("DISPLAY") else "--gpu-context=drm",
-               f"--log-file=/var/log/ad-runner/mpv_player.log"]
+               "--vo=gpu", "--gpu-context=auto"]
 
-        if os.environ.get("DISPLAY"):
-             cmd.extend(["--vo=gpu", "--gpu-context=x11"])
-        else:
-             cmd.extend(["--vo=gpu", "--gpu-context=drm"])
-        
         if is_muted: cmd.append("--mute=yes")
         cmd = cmd + paths
         
-        env = os.environ.copy(); env["DISPLAY"] = env.get("DISPLAY", ":0")
+        env = os.environ.copy()
+        env["DISPLAY"] = env.get("DISPLAY", ":0")
         
-        TIMEOUT_VAL = total_sec + MPV_TIMEOUT_BUFFER
-        self.log.info(f"Playing Batch. Total: {total_sec}s. Watchdog: {TIMEOUT_VAL}s")
-
+        # FIX: Ensure XAUTHORITY is set for Systemd
+        if "XAUTHORITY" not in env:
+            xauth = os.path.expanduser("~/.Xauthority")
+            if os.path.exists(xauth): env["XAUTHORITY"] = xauth
+        
+        self.log.info(f"Playing Batch. Total: {total_sec}s")
+        
         try:
-            subprocess.run(cmd, env=env, check=False, timeout=TIMEOUT_VAL)
+            # CAPTURE STDOUT/STDERR for debugging code 1
+            result = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=total_sec + MPV_TIMEOUT_BUFFER)
+            if result.returncode != 0:
+                self.log.err(f"MPV Failed (Code {result.returncode}).\nLAST LOG LINES:\n" + "\n".join(result.stdout.splitlines()[-15:]))
         except subprocess.TimeoutExpired:
-            self.log.err(f"MPV Freeze detected. Killing.")
+            self.log.err("MPV Timeout. Killing.")
             subprocess.run(["pkill", "-9", "-f", "mpv --fs"], stdout=subprocess.DEVNULL)
+        except Exception as e:
+            self.log.err(f"MPV Execution Error: {e}")
         
         if snap: duck_others(False, snap)
         return len(items)
 
     def run(self):
-        self.log.info(f"Runner Start v0.0.8. ID={self.device}")
+        self.log.info(f"Runner Start v0.0.9. ID={self.device}")
         time.sleep(self.cfg.get("initial_start_delay_secs", 10))
         while True:
             while len(self.queue) < self.cfg.get("queue_max",5):
@@ -719,7 +747,7 @@ ln -sfn "$BASE_DIR/current" "$LEGACY_APP_DIR"
 
 tee /etc/systemd/system/ad-runner.service >/dev/null <<UNIT
 [Unit]
-Description=Flawk Ad Runner (Production v0.0.8)
+Description=Flawk Ad Runner (Production v0.0.9)
 After=network-online.target sound.target graphical-session.target
 Wants=network-online.target
 
@@ -733,8 +761,10 @@ Restart=always
 RestartSec=5
 StartLimitBurst=10
 StartLimitIntervalSec=60
+Nice=-15
 CPUWeight=1000
 Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/$RUN_USER/.Xauthority
 Environment=XDG_RUNTIME_DIR=/run/user/$RUN_UID
 StandardOutput=append:$LOG_DIR/service.log
 StandardError=inherit
