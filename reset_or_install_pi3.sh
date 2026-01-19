@@ -102,6 +102,34 @@ rm -rf "$VERSIONS_DIR"
 rm -f "$BASE_DIR/current"
 
 # ==============================================================================
+# [5.5] SYSTEM TUNING (Pi 3 Specific)
+# ==============================================================================
+echo "== Phase 1.5: Tuning Boot Config =="
+CONFIG_TXT="/boot/config.txt"
+
+# 1. Backup
+if [ ! -f "$CONFIG_TXT.bak" ]; then cp "$CONFIG_TXT" "$CONFIG_TXT.bak"; fi
+
+# 2. Set GPU Memory to 256MB
+# (Removes existing gpu_mem lines and adds the correct one)
+sed -i '/^gpu_mem/d' "$CONFIG_TXT"
+echo "gpu_mem=256" >> "$CONFIG_TXT"
+
+# 3. Enable Fake KMS Driver (vc4-fkms-v3d)
+# (Disable Full KMS if present, enable Fake KMS)
+sed -i 's/^dtoverlay=vc4-kms-v3d/#dtoverlay=vc4-kms-v3d/' "$CONFIG_TXT"
+if ! grep -q "dtoverlay=vc4-fkms-v3d" "$CONFIG_TXT"; then
+    echo "dtoverlay=vc4-fkms-v3d" >> "$CONFIG_TXT"
+fi
+
+# 4. Enable Audio
+if ! grep -q "dtparam=audio=on" "$CONFIG_TXT"; then
+    echo "dtparam=audio=on" >> "$CONFIG_TXT"
+fi
+
+echo "   Boot config updated (Fake KMS + 256MB GPU)."
+
+# ==============================================================================
 # [6] DEPENDENCIES
 # ==============================================================================
 echo "== Phase 2: Dependencies (Safe Mode) =="
@@ -556,14 +584,22 @@ class Runner:
         mpv_log = os.path.join(log_dir, "mpv_playback.log")
 
         # MPV COMMAND - Auto Context & Logging
-        cmd = ["mpv", "--fs", "--no-border", "--really-quiet", 
-               "--ontop", "--force-window=immediate", "--keep-open=no",
-               "--geometry=100%x100%", "--autofit=100%",
-               "--input-default-bindings=no", "--input-vo-keyboard=no", 
-               "--cursor-autohide=always", "--osc=no", #"--prefetch-playlist=yes",
-               "--vo=gpu", "--gpu-context=auto"]
+        cmd = [
+            "mpv", "--fs", "--no-border", "--really-quiet",
+            "--ontop", "--keep-open=no",
+            "--geometry=100%x100%", "--autofit=100%",
+            "--input-default-bindings=no", "--input-vo-keyboard=no",
+            "--cursor-autohide=always", "--osc=no",
+            "--vo=gpu", "--hwdec=mmal-copy", "--gpu-context=x11",
+            "--scale=bilinear", "--video-sync=display-resample"
+        ]
 
-        if is_muted: cmd.append("--mute=yes")
+        if is_muted:
+            # SAVES CPU: Doesn't decode audio at all
+            cmd.append("--no-audio")
+        else:
+            # LOW LATENCY: Direct hardware access
+            cmd.append("--ao=alsa")
         cmd = cmd + paths
         
         env = os.environ.copy()
@@ -761,7 +797,7 @@ Restart=always
 RestartSec=5
 StartLimitBurst=10
 StartLimitIntervalSec=60
-Nice=-15
+Nice=-20
 CPUWeight=1000
 Environment=DISPLAY=:0
 Environment=XAUTHORITY=/home/$RUN_USER/.Xauthority
