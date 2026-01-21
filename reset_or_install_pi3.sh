@@ -113,7 +113,7 @@ if [ ! -f "$CONFIG_TXT.bak" ]; then cp "$CONFIG_TXT" "$CONFIG_TXT.bak"; fi
 # 2. Set GPU Memory to 256MB
 # (Removes existing gpu_mem lines and adds the correct one)
 sed -i '/^gpu_mem/d' "$CONFIG_TXT"
-echo "gpu_mem=256" >> "$CONFIG_TXT"
+echo "gpu_mem=192" >> "$CONFIG_TXT"
 
 # 3. Enable Fake KMS Driver (vc4-fkms-v3d)
 # (Disable Full KMS if present, enable Fake KMS)
@@ -127,15 +127,27 @@ if ! grep -q "dtparam=audio=on" "$CONFIG_TXT"; then
     echo "dtparam=audio=on" >> "$CONFIG_TXT"
 fi
 
-echo "   Boot config updated (Fake KMS + 256MB GPU)."
+echo "   Boot config updated (Fake KMS + 192MB GPU)."
 
 # ==============================================================================
 # [6] DEPENDENCIES
 # ==============================================================================
-echo "== Phase 2: Dependencies (Safe Mode) =="
-# NO apt-get update
-# Try install, but don't fail if repo is unreachable (|| true)
-apt-get install -y mpv python3 python3-venv python3-pip curl ca-certificates jq pulseaudio-utils logrotate coreutils || true
+echo "== Phase 2: Dependencies =="
+
+# Point to Legacy Archives (Required for Buster in 2026)
+sed -i 's|raspbian.raspberrypi.org/raspbian/|legacy.raspbian.org/raspbian/|g' /etc/apt/sources.list
+
+# Refresh package list (Allowing the release info change for EOL repos)
+apt-get update --allow-releaseinfo-change || true
+
+# Install core dependencies + VLC hardware acceleration libraries
+# We include vlc-bin and libavcodec-extra to get the MMAL drivers for MPV
+apt-get install -y \
+    mpv vlc-bin vlc-plugin-video-output libavcodec-extra \
+    python3 python3-venv python3-pip curl ca-certificates jq \
+    pulseaudio-utils logrotate coreutils || true
+
+echo "    Dependencies installed with VLC MMAL support."
 
 # ==============================================================================
 # [7] ARCHITECTURE SETUP
@@ -185,12 +197,12 @@ else
   "api_key": "$DEFAULT_API_KEY",
   "heartbeat_url": "$HEARTBEAT_URL",
   "manifest_url": "$MANIFEST_URL",
-  "width": 1920,
-  "height": 1080,
+  "width": 1080,
+  "height": 720,
   "poll_interval_secs": 10,
   "fill_window_secs": 30,
-  "queue_max": 5,
-  "per_ad_cooldown_secs": 30,
+  "queue_max": 3,
+  "per_ad_cooldown_secs": 20,
   "initial_start_delay_secs": 30,
   "cache_dir": "$DATA_DIR/cache",
   "log_file": "$DATA_DIR/logs/ad_runner.log",
